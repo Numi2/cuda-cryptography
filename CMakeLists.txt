@@ -48,7 +48,7 @@ if(CPB_WITH_CUDA)
   target_link_libraries(cpb_cuda PUBLIC cpb_core CUDA::cudart)
   target_compile_definitions(cpb_cuda PUBLIC CPB_WITH_CUDA=1)
   target_compile_options(cpb_cuda PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --device-int128>)
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   set_target_properties(cpb_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON)

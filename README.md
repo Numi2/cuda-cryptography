@@ -86,6 +86,7 @@ The implementation uses primitive root `7`.
 The CUDA kernels are intentionally simple:
 
 - vector kernels map one field element to one CUDA thread,
+- CUDA field multiplication uses a simple portable double-and-add reduction,
 - NTT launches one kernel per transform stage,
 - Merkle tree hashing launches one kernel per tree level,
 - CUDA SHA-256 is implemented locally for fixed-size leaf and parent inputs.

@@ -37,5 +37,7 @@ The CUDA path mirrors the CPU path:
 - Merkle hashing uses one thread per leaf or parent hash.
 
 The CUDA code deliberately favors readability over aggressive optimization.
-Future versions can replace per-thread root exponentiation, repeated kernel
+CUDA field multiplication currently uses a portable modular double-and-add
+routine to avoid compiler-specific 128-bit device integer support. Future
+versions can replace that, per-thread root exponentiation, repeated kernel
 launches, and host-managed Merkle levels with more optimized designs.

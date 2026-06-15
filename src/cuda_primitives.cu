@@ -37,8 +37,17 @@ __device__ std::uint64_t d_sub(std::uint64_t a, std::uint64_t b) {
 }
 
 __device__ std::uint64_t d_mul(std::uint64_t a, std::uint64_t b) {
-  const auto product = static_cast<unsigned __int128>(a) * b;
-  return static_cast<std::uint64_t>(product % kModulus);
+  std::uint64_t result = 0;
+  while (b != 0) {
+    if ((b & 1U) != 0) {
+      result = d_add(result, a);
+    }
+    b >>= 1U;
+    if (b != 0) {
+      a = d_add(a, a);
+    }
+  }
+  return result;
 }
 
 __device__ std::uint64_t d_pow(std::uint64_t base, std::uint64_t exp) {
