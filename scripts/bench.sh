@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-"$ROOT_DIR/build"}"
+MODE="${CPB_BENCH_MODE:-${BENCH_MODE:-quick}}"
 
 "$ROOT_DIR/scripts/build.sh" -DCMAKE_BUILD_TYPE=Release "$@"
-"$BUILD_DIR/cpb_bench"
+"$BUILD_DIR/cpb_bench" --mode "$MODE"

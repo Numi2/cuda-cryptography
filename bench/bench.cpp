@@ -4,6 +4,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +25,48 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 volatile std::uint64_t g_sink = 0;
+
+enum class BenchMode { Quick, Full };
+
+std::string mode_name(BenchMode mode) {
+  return mode == BenchMode::Full ? "full" : "quick";
+}
+
+BenchMode parse_mode(int argc, char** argv) {
+  std::string value = "quick";
+  if (const char* env = std::getenv("CPB_BENCH_MODE")) {
+    value = env;
+  }
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--full") {
+      value = "full";
+    } else if (arg == "--quick") {
+      value = "quick";
+    } else if (arg == "--mode" && i + 1 < argc) {
+      value = argv[++i];
+    } else if (arg.rfind("--mode=", 0) == 0) {
+      value = arg.substr(7);
+    } else if (arg == "--help" || arg == "-h") {
+      std::cout << "usage: cpb_bench [--mode quick|full] [--quick] [--full]\n";
+      std::exit(0);
+    } else {
+      throw std::invalid_argument("unknown benchmark argument: " + arg);
+    }
+  }
+
+  if (value == "quick") {
+    return BenchMode::Quick;
+  }
+  if (value == "full") {
+    return BenchMode::Full;
+  }
+  throw std::invalid_argument("benchmark mode must be quick or full");
+}
+
+std::string cuda_version_string(int version) {
+  return std::to_string(version / 1000) + "." + std::to_string((version % 1000) / 10);
+}
 
 std::vector<std::uint64_t> deterministic_values(std::size_t n, std::uint64_t seed) {
   std::vector<std::uint64_t> values(n);
@@ -191,7 +234,7 @@ void run_cuda_benchmarks() {
 #endif
 }
 
-void run_mlkem_cuda_benchmarks() {
+void run_mlkem_cuda_benchmarks(BenchMode mode) {
 #ifdef CPB_WITH_CUDA
   if (!cpb::cuda::is_available()) {
     std::cout << "\nCUDA backend was built, but no CUDA device is visible. "
@@ -199,7 +242,11 @@ void run_mlkem_cuda_benchmarks() {
     return;
   }
 
-  for (const std::size_t batch_size : {1UL, 1024UL, 10000UL, 100000UL}) {
+  const std::vector<std::size_t> batches =
+      mode == BenchMode::Full ? std::vector<std::size_t>{1UL, 1024UL, 10000UL, 100000UL}
+                              : std::vector<std::size_t>{1UL, 1024UL};
+
+  for (const std::size_t batch_size : batches) {
     const auto batch = deterministic_poly_batch(batch_size, 701);
     const int iterations = batch_size <= 1024 ? 10 : 3;
     const double batch_ntt_ms = time_ms([&] {
@@ -211,7 +258,7 @@ void run_mlkem_cuda_benchmarks() {
                     static_cast<double>(batch_size) / batch_ntt_ms);
   }
 
-  for (const std::size_t batch_size : {1UL, 1024UL, 10000UL, 100000UL}) {
+  for (const std::size_t batch_size : batches) {
     const auto batch_a = deterministic_poly_batch(batch_size, 1701);
     const auto batch_b = deterministic_poly_batch(batch_size, 2701);
     const int iterations = batch_size <= 1024 ? 5 : 3;
@@ -228,7 +275,7 @@ void run_mlkem_cuda_benchmarks() {
 #endif
 }
 
-void run_poseidon2_cpu_benchmarks() {
+void run_poseidon2_cpu_benchmarks(BenchMode mode) {
   const bool full_cpu = std::getenv("CPB_POSEIDON2_FULL_CPU") != nullptr;
   const std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>> shapes = {
       {"1 x 2^10 leaves", {1, 1UL << 10}},
@@ -238,6 +285,9 @@ void run_poseidon2_cpu_benchmarks() {
   };
 
   for (std::size_t i = 0; i < shapes.size(); ++i) {
+    if (mode == BenchMode::Quick && i > 0) {
+      continue;
+    }
     if (i != 0 && !full_cpu) {
       continue;
     }
@@ -249,13 +299,13 @@ void run_poseidon2_cpu_benchmarks() {
     print_poseidon2_row("CPU", label, result.host_ms, 0.0, result.hashes,
                         result.bytes_absorbed);
   }
-  if (!full_cpu) {
+  if (mode == BenchMode::Full && !full_cpu) {
     std::cout << "CPU full-size Poseidon2 forest rows skipped. Set "
                  "CPB_POSEIDON2_FULL_CPU=1 to run them.\n";
   }
 }
 
-void run_poseidon2_cuda_benchmarks() {
+void run_poseidon2_cuda_benchmarks(BenchMode mode) {
 #ifdef CPB_WITH_CUDA
   if (!cpb::cuda::is_available()) {
     std::cout << "\nCUDA backend was built, but no CUDA device is visible. "
@@ -263,11 +313,17 @@ void run_poseidon2_cuda_benchmarks() {
     return;
   }
 
-  const std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>> shapes = {
-      {"1 x 2^20 leaves", {1, 1UL << 20}},
-      {"1024 x 2^10", {1024, 1UL << 10}},
-      {"65536 x 16", {65536, 16}},
-  };
+  const std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>> shapes =
+      mode == BenchMode::Full
+          ? std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>>{
+                {"1 x 2^20 leaves", {1, 1UL << 20}},
+                {"1024 x 2^10", {1024, 1UL << 10}},
+                {"65536 x 16", {65536, 16}},
+            }
+          : std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>>{
+                {"1 x 2^10 leaves", {1, 1UL << 10}},
+                {"32 x 2^10", {32, 1UL << 10}},
+            };
 
   for (std::size_t i = 0; i < shapes.size(); ++i) {
     const auto& [label, shape] = shapes[i];
@@ -284,12 +340,38 @@ void run_poseidon2_cuda_benchmarks() {
 #endif
 }
 
+void print_cuda_metadata() {
+#ifdef CPB_WITH_CUDA
+  if (!cpb::cuda::is_available()) {
+    std::cout << "CUDA build: enabled, no visible CUDA device\n";
+    return;
+  }
+  const auto info = cpb::cuda::device_info();
+  const double gib = static_cast<double>(info.global_memory_bytes) /
+                     (1024.0 * 1024.0 * 1024.0);
+  std::cout << "CUDA device: " << info.name << " (device " << info.device << ", sm_"
+            << info.major << info.minor << ", " << std::fixed << std::setprecision(2)
+            << gib << " GiB)\n";
+  std::cout << "CUDA runtime: " << cuda_version_string(info.runtime_version)
+            << ", driver: " << cuda_version_string(info.driver_version) << "\n";
+#else
+  std::cout << "CUDA build: disabled\n";
+#endif
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    const BenchMode mode = parse_mode(argc, argv);
     std::cout << "cuda-cryptography benchmark\n";
+    std::cout << "Mode: " << mode_name(mode) << "\n";
     std::cout << "Field modulus: 2^64 - 2^32 + 1 (Goldilocks)\n\n";
+    print_cuda_metadata();
+    std::cout << "Timing note: current public CUDA wrappers allocate and copy per call, "
+                 "so wrapper rows include host/device transfer overhead. Poseidon2 also "
+                 "reports CUDA-event device-only time with leaves and intermediate levels "
+                 "resident.\n\n";
     std::cout << "| Backend | Primitive     |        n |  Time (ms) | Throughput Mops/s |\n";
     std::cout << "|--------:|---------------|---------:|-----------:|-----------------:|\n";
     run_cpu_benchmarks();
@@ -300,15 +382,15 @@ int main() {
     std::cout << "| Backend | Primitive           | Workload     |  Time (ms) | Throughput Kpoly/s |\n";
     std::cout << "|--------:|---------------------|--------------|-----------:|-------------------:|\n";
     run_mlkem_cpu_benchmarks();
-    run_mlkem_cuda_benchmarks();
+    run_mlkem_cuda_benchmarks(mode);
 
     std::cout << "\nPoseidon2-style Goldilocks Merkle forest benchmark\n";
     std::cout << "Host time includes allocation, H2D/D2H transfer, kernels, and root copy. "
                  "Device time is CUDA-event kernel time with leaves and levels resident.\n\n";
     std::cout << "| Backend | Workload               | Host ms    | Device ms   | Host Mhash/s   | Host GB/s   | Device Mhash/s   | Device GB/s   |\n";
     std::cout << "|--------:|------------------------|-----------:|------------:|---------------:|------------:|-----------------:|--------------:|\n";
-    run_poseidon2_cpu_benchmarks();
-    run_poseidon2_cuda_benchmarks();
+    run_poseidon2_cpu_benchmarks(mode);
+    run_poseidon2_cuda_benchmarks(mode);
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Benchmark failed: " << e.what() << '\n';

@@ -4,6 +4,7 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -134,6 +135,17 @@ bool expect_equal(const std::vector<cpb::poseidon2::Digest>& expected,
   return true;
 }
 
+template <typename Fn>
+bool expect_throws(Fn&& fn, const std::string& name) {
+  try {
+    fn();
+  } catch (const std::exception&) {
+    return true;
+  }
+  std::cerr << name << " expected an exception\n";
+  return false;
+}
+
 bool test_field_vectors() {
   const std::uint64_t p = cpb::field::kModulus;
   bool ok = true;
@@ -242,6 +254,25 @@ bool test_poseidon2_merkle_cpu() {
   const auto result = cpb::poseidon2::merkle_forest_roots_cpu(leaves, shape);
 
   bool ok = true;
+  const auto vector_leaves = cpb::poseidon2::deterministic_leaves(4, 777);
+  const auto leaf0 = cpb::poseidon2::hash_leaf_cpu(vector_leaves[0]);
+  const auto leaf1 = cpb::poseidon2::hash_leaf_cpu(vector_leaves[1]);
+  const auto pair01 = cpb::poseidon2::hash_pair_cpu(leaf0, leaf1);
+  const auto small_forest =
+      cpb::poseidon2::merkle_forest_roots_cpu(vector_leaves, {1, 4});
+  ok &= expect_equal({9663374225833733844ULL, 14846115997077300002ULL,
+                      3874052560956134737ULL, 18351804075086715189ULL},
+                     leaf0, "poseidon2 leaf hash vector 0");
+  ok &= expect_equal({15967017389795311074ULL, 12745275773536680036ULL,
+                      18159984983286535455ULL, 703431422288797923ULL},
+                     leaf1, "poseidon2 leaf hash vector 1");
+  ok &= expect_equal({167455533063635113ULL, 11393647405094625292ULL,
+                      9588948309221566780ULL, 6402483533664955761ULL},
+                     pair01, "poseidon2 pair hash vector");
+  ok &= expect_equal({5921759479114827537ULL, 16802967967082501393ULL,
+                      766461081830350271ULL, 8482344946004106393ULL},
+                     small_forest.roots.front(), "poseidon2 small forest root vector");
+
   ok &= result.roots.size() == shape.tree_count;
   ok &= result.hashes == cpb::poseidon2::merkle_hash_count(shape);
   ok &= result.bytes_absorbed == cpb::poseidon2::absorbed_bytes_for_hashes(result.hashes);
@@ -264,6 +295,30 @@ bool test_poseidon2_merkle_cpu() {
     ok &= cpb::poseidon2::verify_auth_path_cpu(auth_path);
   }
 
+  ok &= expect_throws(
+      [&] { cpb::poseidon2::merkle_forest_roots_cpu(leaves, {0, 8}); },
+      "poseidon2 rejects zero tree count");
+  ok &= expect_throws(
+      [&] { cpb::poseidon2::merkle_forest_roots_cpu(leaves, {1, 0}); },
+      "poseidon2 rejects zero leaves per tree");
+  ok &= expect_throws(
+      [&] { cpb::poseidon2::merkle_forest_roots_cpu(leaves, {1, 3}); },
+      "poseidon2 rejects non-power-of-two leaves");
+  ok &= expect_throws(
+      [&] {
+        cpb::poseidon2::merkle_forest_roots_cpu(
+            std::span<const cpb::poseidon2::Leaf>(leaves.data(), leaves.size() - 1),
+            shape);
+      },
+      "poseidon2 rejects mismatched leaf count");
+  ok &= expect_throws(
+      [&] {
+        const std::array<std::size_t, 2> bad_trees = {0, 1};
+        const std::array<std::size_t, 1> bad_indices = {0};
+        cpb::poseidon2::merkle_auth_paths_cpu(leaves, shape, bad_trees, bad_indices);
+      },
+      "poseidon2 rejects mismatched auth-path index counts");
+
   if (!ok) {
     std::cerr << "Poseidon2-style Merkle forest CPU test failed\n";
   }
@@ -278,6 +333,25 @@ bool test_cuda_primitives() {
   }
 
   bool ok = true;
+  ok &= expect_equal(std::vector<std::uint64_t>{}, cpb::cuda::vector_add({}, {}),
+                     "cuda empty vector_add");
+  ok &= expect_equal(std::vector<std::uint64_t>{}, cpb::cuda::vector_mul({}, {}),
+                     "cuda empty vector_mul");
+  ok &= expect_equal(std::vector<cpb::mlkem::Poly>{}, cpb::cuda::mlkem_ntt_batch({}),
+                     "cuda empty mlkem ntt batch");
+  ok &= expect_equal(std::vector<cpb::mlkem::Poly>{},
+                     cpb::cuda::mlkem_poly_mul_ntt_batch({}, {}),
+                     "cuda empty mlkem poly mul batch");
+  ok &= expect_throws(
+      [&] { cpb::cuda::vector_add({1}, {}); },
+      "cuda vector_add rejects mismatched sizes");
+  ok &= expect_throws(
+      [&] { cpb::cuda::vector_mul({1}, {}); },
+      "cuda vector_mul rejects mismatched sizes");
+  ok &= expect_throws(
+      [&] { cpb::cuda::poseidon2_merkle_forest({}, {0, 0}); },
+      "cuda poseidon2 rejects empty shape");
+
   for (const std::size_t n : {1UL, 2UL, 1024UL, 4096UL}) {
     const auto a = deterministic_values(n, 11);
     const auto b = deterministic_values(n, 12);
@@ -319,6 +393,12 @@ bool test_cuda_primitives() {
                      "cuda mlkem ntt batch");
   ok &= expect_equal(expected_mul, cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, batch_b),
                      "cuda mlkem poly mul batch");
+  ok &= expect_throws(
+      [&] {
+        std::vector<cpb::mlkem::Poly> shorter(31);
+        cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, shorter);
+      },
+      "cuda mlkem rejects mismatched batch sizes");
 
   const cpb::poseidon2::ForestShape p2_shape{4, 16};
   const auto p2_leaves = cpb::poseidon2::deterministic_leaves(

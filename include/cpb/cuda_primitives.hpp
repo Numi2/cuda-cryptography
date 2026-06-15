@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "cpb/mlkem.hpp"
@@ -9,7 +11,18 @@
 
 namespace cpb::cuda {
 
+struct DeviceInfo {
+  int device = 0;
+  std::string name;
+  int runtime_version = 0;
+  int driver_version = 0;
+  int major = 0;
+  int minor = 0;
+  std::size_t global_memory_bytes = 0;
+};
+
 bool is_available();
+DeviceInfo device_info();
 
 std::vector<std::uint64_t> vector_add(const std::vector<std::uint64_t>& a,
                                       const std::vector<std::uint64_t>& b);

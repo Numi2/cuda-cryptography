@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -25,6 +26,87 @@ void check(cudaError_t err, const char* context) {
     throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(err));
   }
 }
+
+template <typename T>
+class DeviceBuffer {
+ public:
+  DeviceBuffer() = default;
+
+  explicit DeviceBuffer(std::size_t count) : count_(count) {
+    if (count_ != 0) {
+      check(cudaMalloc(reinterpret_cast<void**>(&ptr_), bytes()), "cudaMalloc DeviceBuffer");
+    }
+  }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), count_(other.count_) {
+    other.ptr_ = nullptr;
+    other.count_ = 0;
+  }
+
+  DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+    if (this != &other) {
+      reset();
+      ptr_ = other.ptr_;
+      count_ = other.count_;
+      other.ptr_ = nullptr;
+      other.count_ = 0;
+    }
+    return *this;
+  }
+
+  ~DeviceBuffer() {
+    reset();
+  }
+
+  T* data() { return ptr_; }
+  const T* data() const { return ptr_; }
+  std::size_t count() const { return count_; }
+  std::size_t bytes() const { return count_ * sizeof(T); }
+
+  void copy_from_host(const void* src, std::size_t byte_count, const char* context) {
+    check(cudaMemcpy(ptr_, src, byte_count, cudaMemcpyHostToDevice), context);
+  }
+
+  void copy_to_host(void* dst, std::size_t byte_count, const char* context) const {
+    check(cudaMemcpy(dst, ptr_, byte_count, cudaMemcpyDeviceToHost), context);
+  }
+
+ private:
+  void reset() noexcept {
+    if (ptr_ != nullptr) {
+      cudaFree(ptr_);
+      ptr_ = nullptr;
+      count_ = 0;
+    }
+  }
+
+  T* ptr_ = nullptr;
+  std::size_t count_ = 0;
+};
+
+class CudaEvent {
+ public:
+  CudaEvent() {
+    check(cudaEventCreate(&event_), "cudaEventCreate");
+  }
+
+  CudaEvent(const CudaEvent&) = delete;
+  CudaEvent& operator=(const CudaEvent&) = delete;
+
+  ~CudaEvent() {
+    if (event_ != nullptr) {
+      cudaEventDestroy(event_);
+    }
+  }
+
+  cudaEvent_t get() const { return event_; }
+
+ private:
+  cudaEvent_t event_ = nullptr;
+};
 
 __device__ __forceinline__ std::uint64_t d_add(std::uint64_t a, std::uint64_t b) {
   const std::uint64_t sum = a + b;
@@ -618,6 +700,7 @@ __global__ void p2_leaf_kernel(const std::uint64_t* leaves,
   for (std::size_t i = 0; i < poseidon2::kRateWords; ++i) {
     state[i] = leaf[i];
   }
+  // Domain tags keep leaf and internal-node hashes distinct in this benchmark hash.
   state[poseidon2::kRateWords] = 1;
   p2_permute(state);
 
@@ -649,6 +732,7 @@ __global__ void p2_parent_kernel(const std::uint64_t* current,
     state[i] = left[i];
     state[i + poseidon2::kDigestWords] = right[i];
   }
+  // Domain tags keep leaf and internal-node hashes distinct in this benchmark hash.
   state[poseidon2::kRateWords] = 2;
   p2_permute(state);
 
@@ -665,6 +749,24 @@ bool is_available() {
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
 
+DeviceInfo device_info() {
+  int device = 0;
+  check(cudaGetDevice(&device), "cudaGetDevice");
+
+  cudaDeviceProp props{};
+  check(cudaGetDeviceProperties(&props, device), "cudaGetDeviceProperties");
+
+  DeviceInfo info;
+  info.device = device;
+  info.name = props.name;
+  check(cudaRuntimeGetVersion(&info.runtime_version), "cudaRuntimeGetVersion");
+  check(cudaDriverGetVersion(&info.driver_version), "cudaDriverGetVersion");
+  info.major = props.major;
+  info.minor = props.minor;
+  info.global_memory_bytes = props.totalGlobalMem;
+  return info;
+}
+
 std::vector<std::uint64_t> vector_add(const std::vector<std::uint64_t>& a,
                                       const std::vector<std::uint64_t>& b) {
   if (a.size() != b.size()) {
@@ -674,27 +776,20 @@ std::vector<std::uint64_t> vector_add(const std::vector<std::uint64_t>& a,
     return {};
   }
 
-  std::uint64_t* d_a = nullptr;
-  std::uint64_t* d_b = nullptr;
-  std::uint64_t* d_out = nullptr;
-  const std::size_t bytes = a.size() * sizeof(std::uint64_t);
-  check(cudaMalloc(&d_a, bytes), "cudaMalloc d_a");
-  check(cudaMalloc(&d_b, bytes), "cudaMalloc d_b");
-  check(cudaMalloc(&d_out, bytes), "cudaMalloc d_out");
-  check(cudaMemcpy(d_a, a.data(), bytes, cudaMemcpyHostToDevice), "copy a to device");
-  check(cudaMemcpy(d_b, b.data(), bytes, cudaMemcpyHostToDevice), "copy b to device");
+  DeviceBuffer<std::uint64_t> d_a(a.size());
+  DeviceBuffer<std::uint64_t> d_b(b.size());
+  DeviceBuffer<std::uint64_t> d_out(a.size());
+  d_a.copy_from_host(a.data(), d_a.bytes(), "copy a to device");
+  d_b.copy_from_host(b.data(), d_b.bytes(), "copy b to device");
 
   constexpr int kBlockSize = 256;
   const int blocks = static_cast<int>((a.size() + kBlockSize - 1) / kBlockSize);
-  vector_add_kernel<<<blocks, kBlockSize>>>(d_a, d_b, d_out, a.size());
+  vector_add_kernel<<<blocks, kBlockSize>>>(d_a.data(), d_b.data(), d_out.data(), a.size());
   check(cudaGetLastError(), "vector_add_kernel");
   check(cudaDeviceSynchronize(), "vector_add synchronize");
 
   std::vector<std::uint64_t> out(a.size());
-  check(cudaMemcpy(out.data(), d_out, bytes, cudaMemcpyDeviceToHost), "copy add output");
-  cudaFree(d_a);
-  cudaFree(d_b);
-  cudaFree(d_out);
+  d_out.copy_to_host(out.data(), d_out.bytes(), "copy add output");
   return out;
 }
 
@@ -707,27 +802,20 @@ std::vector<std::uint64_t> vector_mul(const std::vector<std::uint64_t>& a,
     return {};
   }
 
-  std::uint64_t* d_a = nullptr;
-  std::uint64_t* d_b = nullptr;
-  std::uint64_t* d_out = nullptr;
-  const std::size_t bytes = a.size() * sizeof(std::uint64_t);
-  check(cudaMalloc(&d_a, bytes), "cudaMalloc d_a");
-  check(cudaMalloc(&d_b, bytes), "cudaMalloc d_b");
-  check(cudaMalloc(&d_out, bytes), "cudaMalloc d_out");
-  check(cudaMemcpy(d_a, a.data(), bytes, cudaMemcpyHostToDevice), "copy a to device");
-  check(cudaMemcpy(d_b, b.data(), bytes, cudaMemcpyHostToDevice), "copy b to device");
+  DeviceBuffer<std::uint64_t> d_a(a.size());
+  DeviceBuffer<std::uint64_t> d_b(b.size());
+  DeviceBuffer<std::uint64_t> d_out(a.size());
+  d_a.copy_from_host(a.data(), d_a.bytes(), "copy a to device");
+  d_b.copy_from_host(b.data(), d_b.bytes(), "copy b to device");
 
   constexpr int kBlockSize = 256;
   const int blocks = static_cast<int>((a.size() + kBlockSize - 1) / kBlockSize);
-  vector_mul_kernel<<<blocks, kBlockSize>>>(d_a, d_b, d_out, a.size());
+  vector_mul_kernel<<<blocks, kBlockSize>>>(d_a.data(), d_b.data(), d_out.data(), a.size());
   check(cudaGetLastError(), "vector_mul_kernel");
   check(cudaDeviceSynchronize(), "vector_mul synchronize");
 
   std::vector<std::uint64_t> out(a.size());
-  check(cudaMemcpy(out.data(), d_out, bytes, cudaMemcpyDeviceToHost), "copy mul output");
-  cudaFree(d_a);
-  cudaFree(d_b);
-  cudaFree(d_out);
+  d_out.copy_to_host(out.data(), d_out.bytes(), "copy mul output");
   return out;
 }
 
@@ -738,18 +826,13 @@ std::vector<std::uint64_t> ntt(const std::vector<std::uint64_t>& values, bool in
     return values;
   }
 
-  std::uint64_t* d_values = nullptr;
-  std::uint64_t* d_twiddles = nullptr;
-  const std::size_t bytes = n * sizeof(std::uint64_t);
-  check(cudaMalloc(&d_values, bytes), "cudaMalloc ntt values");
-  check(cudaMalloc(&d_twiddles, (n / 2) * sizeof(std::uint64_t)),
-        "cudaMalloc ntt twiddles");
-  check(cudaMemcpy(d_values, values.data(), bytes, cudaMemcpyHostToDevice),
-        "copy ntt input to device");
+  DeviceBuffer<std::uint64_t> d_values(n);
+  DeviceBuffer<std::uint64_t> d_twiddles(n / 2);
+  d_values.copy_from_host(values.data(), d_values.bytes(), "copy ntt input to device");
 
   constexpr int kBlockSize = 256;
   int blocks = static_cast<int>((n + kBlockSize - 1) / kBlockSize);
-  bit_reverse_kernel<<<blocks, kBlockSize>>>(d_values, n, static_cast<int>(bits));
+  bit_reverse_kernel<<<blocks, kBlockSize>>>(d_values.data(), n, static_cast<int>(bits));
   check(cudaGetLastError(), "bit_reverse_kernel");
   check(cudaDeviceSynchronize(), "bit_reverse synchronize");
 
@@ -757,12 +840,12 @@ std::vector<std::uint64_t> ntt(const std::vector<std::uint64_t>& values, bool in
     const std::uint64_t w_len = field::root_of_unity(len, inverse);
     const std::size_t half = len / 2;
     blocks = static_cast<int>((half + kBlockSize - 1) / kBlockSize);
-    twiddle_kernel<<<blocks, kBlockSize>>>(d_twiddles, half, w_len);
+    twiddle_kernel<<<blocks, kBlockSize>>>(d_twiddles.data(), half, w_len);
     check(cudaGetLastError(), "twiddle_kernel");
     check(cudaDeviceSynchronize(), "twiddle synchronize");
 
     blocks = static_cast<int>(((n / 2) + kBlockSize - 1) / kBlockSize);
-    ntt_stage_kernel<<<blocks, kBlockSize>>>(d_values, n, len, d_twiddles);
+    ntt_stage_kernel<<<blocks, kBlockSize>>>(d_values.data(), n, len, d_twiddles.data());
     check(cudaGetLastError(), "ntt_stage_kernel");
     check(cudaDeviceSynchronize(), "ntt stage synchronize");
   }
@@ -770,15 +853,13 @@ std::vector<std::uint64_t> ntt(const std::vector<std::uint64_t>& values, bool in
   if (inverse) {
     const std::uint64_t inv_n = field::inverse(static_cast<std::uint64_t>(n));
     blocks = static_cast<int>((n + kBlockSize - 1) / kBlockSize);
-    scale_kernel<<<blocks, kBlockSize>>>(d_values, n, inv_n);
+    scale_kernel<<<blocks, kBlockSize>>>(d_values.data(), n, inv_n);
     check(cudaGetLastError(), "scale_kernel");
     check(cudaDeviceSynchronize(), "scale synchronize");
   }
 
   std::vector<std::uint64_t> out(n);
-  check(cudaMemcpy(out.data(), d_values, bytes, cudaMemcpyDeviceToHost), "copy ntt output");
-  cudaFree(d_values);
-  cudaFree(d_twiddles);
+  d_values.copy_to_host(out.data(), d_values.bytes(), "copy ntt output");
   return out;
 }
 
@@ -830,34 +911,24 @@ Sha256Digest merkle_root(const std::vector<std::uint64_t>& leaves) {
 }
 
 mlkem::Poly mlkem_poly_mul_ntt(const mlkem::Poly& a, const mlkem::Poly& b) {
-  std::uint16_t* d_a = nullptr;
-  std::uint16_t* d_b = nullptr;
-  std::uint16_t* d_out = nullptr;
-  std::uint16_t* d_twiddles = nullptr;
   constexpr std::size_t kBytes = mlkem::kPolyDegree * sizeof(std::uint16_t);
 
-  check(cudaMalloc(&d_a, kBytes), "cudaMalloc mlkem a");
-  check(cudaMalloc(&d_b, kBytes), "cudaMalloc mlkem b");
-  check(cudaMalloc(&d_out, kBytes), "cudaMalloc mlkem out");
-  check(cudaMalloc(&d_twiddles, (mlkem::kPolyDegree / 2) * sizeof(std::uint16_t)),
-        "cudaMalloc mlkem twiddles");
-  check(cudaMemcpy(d_a, a.data(), kBytes, cudaMemcpyHostToDevice), "copy mlkem a");
-  check(cudaMemcpy(d_b, b.data(), kBytes, cudaMemcpyHostToDevice), "copy mlkem b");
+  DeviceBuffer<std::uint16_t> d_a(mlkem::kPolyDegree);
+  DeviceBuffer<std::uint16_t> d_b(mlkem::kPolyDegree);
+  DeviceBuffer<std::uint16_t> d_out(mlkem::kPolyDegree);
+  DeviceBuffer<std::uint16_t> d_twiddles(mlkem::kPolyDegree / 2);
+  d_a.copy_from_host(a.data(), kBytes, "copy mlkem a");
+  d_b.copy_from_host(b.data(), kBytes, "copy mlkem b");
 
-  kyber_ntt_device(d_a, d_twiddles, false);
-  kyber_ntt_device(d_b, d_twiddles, false);
-  kyber_pointwise_mul_kernel<<<1, 256>>>(d_a, d_b, d_out);
+  kyber_ntt_device(d_a.data(), d_twiddles.data(), false);
+  kyber_ntt_device(d_b.data(), d_twiddles.data(), false);
+  kyber_pointwise_mul_kernel<<<1, 256>>>(d_a.data(), d_b.data(), d_out.data());
   check(cudaGetLastError(), "kyber_pointwise_mul_kernel");
   check(cudaDeviceSynchronize(), "kyber pointwise synchronize");
-  kyber_ntt_device(d_out, d_twiddles, true);
+  kyber_ntt_device(d_out.data(), d_twiddles.data(), true);
 
   mlkem::Poly out{};
-  check(cudaMemcpy(out.data(), d_out, kBytes, cudaMemcpyDeviceToHost),
-        "copy mlkem output");
-  cudaFree(d_a);
-  cudaFree(d_b);
-  cudaFree(d_out);
-  cudaFree(d_twiddles);
+  d_out.copy_to_host(out.data(), kBytes, "copy mlkem output");
   return out;
 }
 
@@ -867,22 +938,15 @@ std::vector<mlkem::Poly> mlkem_ntt_batch(const std::vector<mlkem::Poly>& polys,
     return {};
   }
 
-  std::uint16_t* d_values = nullptr;
-  std::uint16_t* d_twiddles = nullptr;
-  const std::size_t bytes = polys.size() * sizeof(mlkem::Poly);
-  check(cudaMalloc(&d_values, bytes), "cudaMalloc mlkem ntt batch values");
-  check(cudaMalloc(&d_twiddles, (mlkem::kPolyDegree / 2) * sizeof(std::uint16_t)),
-        "cudaMalloc mlkem ntt batch twiddles");
-  check(cudaMemcpy(d_values, polys.data(), bytes, cudaMemcpyHostToDevice),
-        "copy mlkem ntt batch input");
+  DeviceBuffer<mlkem::Poly> d_values(polys.size());
+  DeviceBuffer<std::uint16_t> d_twiddles(mlkem::kPolyDegree / 2);
+  d_values.copy_from_host(polys.data(), d_values.bytes(), "copy mlkem ntt batch input");
 
-  kyber_ntt_batch_device(d_values, polys.size(), d_twiddles, inverse);
+  kyber_ntt_batch_device(reinterpret_cast<std::uint16_t*>(d_values.data()), polys.size(),
+                         d_twiddles.data(), inverse);
 
   std::vector<mlkem::Poly> out(polys.size());
-  check(cudaMemcpy(out.data(), d_values, bytes, cudaMemcpyDeviceToHost),
-        "copy mlkem ntt batch output");
-  cudaFree(d_values);
-  cudaFree(d_twiddles);
+  d_values.copy_to_host(out.data(), d_values.bytes(), "copy mlkem ntt batch output");
   return out;
 }
 
@@ -896,34 +960,26 @@ std::vector<mlkem::Poly> mlkem_poly_mul_ntt_batch(
     return {};
   }
 
-  std::uint16_t* d_a = nullptr;
-  std::uint16_t* d_b = nullptr;
-  std::uint16_t* d_out = nullptr;
-  std::uint16_t* d_twiddles = nullptr;
-  const std::size_t bytes = a.size() * sizeof(mlkem::Poly);
-  check(cudaMalloc(&d_a, bytes), "cudaMalloc mlkem batch a");
-  check(cudaMalloc(&d_b, bytes), "cudaMalloc mlkem batch b");
-  check(cudaMalloc(&d_out, bytes), "cudaMalloc mlkem batch out");
-  check(cudaMalloc(&d_twiddles, (mlkem::kPolyDegree / 2) * sizeof(std::uint16_t)),
-        "cudaMalloc mlkem batch twiddles");
-  check(cudaMemcpy(d_a, a.data(), bytes, cudaMemcpyHostToDevice), "copy mlkem batch a");
-  check(cudaMemcpy(d_b, b.data(), bytes, cudaMemcpyHostToDevice), "copy mlkem batch b");
+  DeviceBuffer<mlkem::Poly> d_a(a.size());
+  DeviceBuffer<mlkem::Poly> d_b(b.size());
+  DeviceBuffer<mlkem::Poly> d_out(a.size());
+  DeviceBuffer<std::uint16_t> d_twiddles(mlkem::kPolyDegree / 2);
+  d_a.copy_from_host(a.data(), d_a.bytes(), "copy mlkem batch a");
+  d_b.copy_from_host(b.data(), d_b.bytes(), "copy mlkem batch b");
 
-  kyber_ntt_batch_device(d_a, a.size(), d_twiddles, false);
-  kyber_ntt_batch_device(d_b, b.size(), d_twiddles, false);
+  auto* a_words = reinterpret_cast<std::uint16_t*>(d_a.data());
+  auto* b_words = reinterpret_cast<std::uint16_t*>(d_b.data());
+  auto* out_words = reinterpret_cast<std::uint16_t*>(d_out.data());
+  kyber_ntt_batch_device(a_words, a.size(), d_twiddles.data(), false);
+  kyber_ntt_batch_device(b_words, b.size(), d_twiddles.data(), false);
   kyber_batched_pointwise_mul_kernel<<<static_cast<unsigned int>(a.size()), 256>>>(
-      d_a, d_b, d_out, a.size());
+      a_words, b_words, out_words, a.size());
   check(cudaGetLastError(), "kyber_batched_pointwise_mul_kernel");
   check(cudaDeviceSynchronize(), "kyber batched pointwise synchronize");
-  kyber_ntt_batch_device(d_out, a.size(), d_twiddles, true);
+  kyber_ntt_batch_device(out_words, a.size(), d_twiddles.data(), true);
 
   std::vector<mlkem::Poly> out(a.size());
-  check(cudaMemcpy(out.data(), d_out, bytes, cudaMemcpyDeviceToHost),
-        "copy mlkem batch output");
-  cudaFree(d_a);
-  cudaFree(d_b);
-  cudaFree(d_out);
-  cudaFree(d_twiddles);
+  d_out.copy_to_host(out.data(), d_out.bytes(), "copy mlkem batch output");
   return out;
 }
 
@@ -941,50 +997,45 @@ poseidon2::ForestBuildResult poseidon2_merkle_forest(
 
   const auto host_start = std::chrono::steady_clock::now();
 
-  std::uint64_t* d_leaves = nullptr;
-  std::uint64_t* d_current = nullptr;
-  std::uint64_t* d_next = nullptr;
-  const std::size_t leaf_bytes = leaves.size() * sizeof(poseidon2::Leaf);
-  const std::size_t max_digest_bytes =
-      total_leaves * poseidon2::kDigestWords * sizeof(std::uint64_t);
-  check(cudaMalloc(&d_leaves, leaf_bytes), "cudaMalloc poseidon2 leaves");
-  check(cudaMalloc(&d_current, max_digest_bytes), "cudaMalloc poseidon2 current");
-  check(cudaMalloc(&d_next, max_digest_bytes / 2), "cudaMalloc poseidon2 next");
-  check(cudaMemcpy(d_leaves, leaves.data(), leaf_bytes, cudaMemcpyHostToDevice),
-        "copy poseidon2 leaves");
+  DeviceBuffer<poseidon2::Leaf> d_leaves(leaves.size());
+  DeviceBuffer<std::uint64_t> d_current(total_leaves * poseidon2::kDigestWords);
+  DeviceBuffer<std::uint64_t> d_next(
+      std::max<std::size_t>(1, (total_leaves * poseidon2::kDigestWords) / 2));
+  d_leaves.copy_from_host(leaves.data(), d_leaves.bytes(), "copy poseidon2 leaves");
 
-  cudaEvent_t device_start = nullptr;
-  cudaEvent_t device_end = nullptr;
-  check(cudaEventCreate(&device_start), "create poseidon2 device start event");
-  check(cudaEventCreate(&device_end), "create poseidon2 device end event");
-  check(cudaEventRecord(device_start), "record poseidon2 device start");
+  CudaEvent device_start;
+  CudaEvent device_end;
+  check(cudaEventRecord(device_start.get()), "record poseidon2 device start");
 
   constexpr int kBlockSize = 256;
   int blocks = static_cast<int>((total_leaves + kBlockSize - 1) / kBlockSize);
-  p2_leaf_kernel<<<blocks, kBlockSize>>>(d_leaves, d_current, total_leaves);
+  auto* current = d_current.data();
+  auto* next = d_next.data();
+  p2_leaf_kernel<<<blocks, kBlockSize>>>(
+      reinterpret_cast<const std::uint64_t*>(d_leaves.data()), current, total_leaves);
   check(cudaGetLastError(), "p2_leaf_kernel");
 
   std::size_t level_count = shape.leaves_per_tree;
   while (level_count > 1) {
     const std::size_t total_parents = shape.tree_count * (level_count / 2);
     blocks = static_cast<int>((total_parents + kBlockSize - 1) / kBlockSize);
-    p2_parent_kernel<<<blocks, kBlockSize>>>(d_current, d_next, shape.tree_count,
+    p2_parent_kernel<<<blocks, kBlockSize>>>(current, next, shape.tree_count,
                                              level_count);
     check(cudaGetLastError(), "p2_parent_kernel");
-    std::swap(d_current, d_next);
+    // Parent levels alternate between two resident device buffers; only roots return.
+    std::swap(current, next);
     level_count >>= 1U;
   }
 
-  check(cudaEventRecord(device_end), "record poseidon2 device end");
-  check(cudaEventSynchronize(device_end), "synchronize poseidon2 device end");
+  check(cudaEventRecord(device_end.get()), "record poseidon2 device end");
+  check(cudaEventSynchronize(device_end.get()), "synchronize poseidon2 device end");
   float device_ms = 0.0F;
-  check(cudaEventElapsedTime(&device_ms, device_start, device_end),
+  check(cudaEventElapsedTime(&device_ms, device_start.get(), device_end.get()),
         "elapsed poseidon2 device time");
 
   poseidon2::ForestBuildResult result;
   result.roots.resize(shape.tree_count);
-  check(cudaMemcpy(result.roots.data(), d_current,
-                   shape.tree_count * sizeof(poseidon2::Digest),
+  check(cudaMemcpy(result.roots.data(), current, shape.tree_count * sizeof(poseidon2::Digest),
                    cudaMemcpyDeviceToHost),
         "copy poseidon2 roots");
 
@@ -994,12 +1045,6 @@ poseidon2::ForestBuildResult poseidon2_merkle_forest(
   result.device_ms = static_cast<double>(device_ms);
   result.hashes = poseidon2::merkle_hash_count(shape);
   result.bytes_absorbed = poseidon2::absorbed_bytes_for_hashes(result.hashes);
-
-  cudaEventDestroy(device_start);
-  cudaEventDestroy(device_end);
-  cudaFree(d_leaves);
-  cudaFree(d_current);
-  cudaFree(d_next);
   return result;
 }
 
