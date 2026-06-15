@@ -12,11 +12,100 @@ used to protect real assets.
 - finite-field arithmetic over the Goldilocks prime `p = 2^64 - 2^32 + 1`,
 - field vector add and multiply,
 - radix-2 NTT over the same field,
-- Merkle tree root construction using SHA-256.
+- Merkle tree root construction using SHA-256,
+- ML-KEM/Kyber-style NTT polynomial multiplication over `q = 3329`.
 
 Each primitive has a straightforward CPU reference implementation. CUDA builds
 add GPU implementations and correctness tests that compare CPU output against
 CUDA output.
+
+## Why These Workloads
+
+### Batched ML-KEM / ML-DSA
+
+NVIDIA cuPQC directly targets ML-KEM and ML-DSA, including high-throughput
+GPU public-key operations. Its public material reports H100 throughput for
+ML-KEM-768 key generation, encapsulation, and decapsulation in millions of
+operations per second, which makes batched PQC highly relevant to NVIDIA-facing
+GPU cryptography work.
+
+Source: [NVIDIA cuPQC](https://developer.nvidia.com/cupqc)
+
+### Hashing + Merkle Forests
+
+NVIDIA cuPQC highlights SHA-2, SHA-3, SHAKE, Poseidon2, and Merkle trees.
+Its Merkle tree discussion emphasizes larger tree sizes, which matches the
+CUDA story: more leaves expose more parallelism and make GPU residency matter.
+
+Source: [NVIDIA cuPQC Hash/Merkle](https://developer.nvidia.com/cupqc)
+
+### ZK Proof Kernels: MSM + NTT
+
+ZK GPU performance research identifies MSM and NTT as the dominant prover
+kernels; the cited paper notes that other kernels are under 5% of total time in
+its breakdown. It also calls out NTT bottlenecks at scale and overheads from
+CPU-GPU transfers and repeated kernel launches. This project therefore focuses
+on batching, device residency, and NTT/Merkle kernels rather than isolated tiny
+operations.
+
+Source: [ZKProphet GPU ZKP performance](https://arxiv.org/html/2509.22684v1)
+
+### Large Batched NTT for Lattice/FHE/PQC
+
+NTT is core to Kyber/ML-KEM, Dilithium/ML-DSA, and many FHE/proof-system
+workloads. A single Kyber-sized `n = 256` polynomial is too small to make CUDA
+look good by itself, so the benchmark headline is batched ML-KEM-style NTT and
+polynomial multiplication at `1`, `1K`, `10K`, and `100K` polynomial batches.
+
+Source: [Cambridge/OpenTitan NTT acceleration paper](https://www.cl.cam.ac.uk/~fms27/papers/2024-UrquhartStajano-acceleration.pdf)
+
+## ML-KEM/Kyber Primitive Path
+
+This module is an ML-KEM/Kyber-style primitive benchmark around hot kernels,
+not a complete ML-KEM implementation. It uses:
+
+- modulus `q = 3329`,
+- degree `n = 256`,
+- primitive 256th root `17`,
+- CPU schoolbook polynomial multiplication as the obvious reference,
+- CPU NTT polynomial multiplication,
+- CUDA batched NTT and batched NTT-based polynomial multiplication.
+
+The benchmark includes:
+
+- CPU ML-KEM NTT `n=256`,
+- CUDA ML-KEM NTT `batch=1`,
+- CUDA ML-KEM NTT `batch=1024`, `batch=10000`, and `batch=100000`,
+- CUDA ML-KEM poly mul `batch=1`,
+- CUDA ML-KEM poly mul `batch=1024`, `batch=10000`, and `batch=100000`.
+
+The single-polynomial CUDA row is intentionally included to show launch and
+transfer overhead. The meaningful GPU story is the batched path.
+
+This is not production cryptography. It is not a constant-time, audited, or
+standards-complete ML-KEM implementation.
+
+## Recommended Next Addition: Poseidon2 Merkle Forests
+
+The strongest next module for `cuda-cryptography` is `poseidon2_merkle_forest`.
+It aligns with NVIDIA cuPQC's public direction around GPU hash, Merkle, and
+Poseidon2 workloads, fits ZK/proof-system roles better than plain SHA-256, and
+extends the existing field and Merkle code instead of starting from scratch.
+
+Target design:
+
+- Poseidon2 hash over BabyBear or Goldilocks field,
+- CPU reference implementation,
+- CUDA implementation,
+- batched Merkle tree builder for one tree with `2^20` leaves,
+- batched Merkle forest builder for `1024` trees with `2^10` leaves,
+- `65536` small authentication trees,
+- leaves and intermediate levels kept GPU-resident,
+- CPU vs CUDA benchmark with host-transfer-included timing,
+- device-only timing,
+- throughput in hashes/sec and GB/s,
+- proof path generation for many leaves,
+- CPU verification of generated authentication paths.
 
 ## Build
 
@@ -58,9 +147,10 @@ The benchmark prints elapsed time and throughput for several input sizes. GPU
 rows are shown only when the project is built with CUDA and a CUDA device is
 visible.
 
-## Validated CUDA Results
+## Validated CUDA Results: Goldilocks/SHA-256 Path
 
-Validated on an NVIDIA RTX A6000 using CUDA 12.4:
+The original Goldilocks NTT, field arithmetic, and SHA-256 Merkle path was
+validated on an NVIDIA RTX A6000 using CUDA 12.4:
 
 - CUDA build passed,
 - correctness tests passed,

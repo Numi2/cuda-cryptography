@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(cuda_pqc_bench
+project(cuda_cryptography
   VERSION 0.1.0
   DESCRIPTION "CUDA/C++ benchmarks for proof-system-adjacent cryptographic primitives"
   LANGUAGES CXX)
@@ -34,6 +34,7 @@ else()
 endif()
 
 add_library(cpb_core
+  src/mlkem_cpu.cpp
   src/merkle_cpu.cpp
   src/ntt_cpu.cpp
   src/sha256.cpp

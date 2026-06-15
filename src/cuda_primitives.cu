@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "cpb/field.hpp"
+#include "cpb/mlkem.hpp"
 
 namespace cpb::cuda {
 
@@ -310,6 +311,232 @@ __global__ void merkle_parent_kernel(const std::uint8_t* current,
   sha256_device(bytes, 64, next + i * 32);
 }
 
+__device__ __forceinline__ std::uint16_t kyber_add(std::uint16_t a, std::uint16_t b) {
+  const std::uint32_t sum = static_cast<std::uint32_t>(a) + b;
+  return static_cast<std::uint16_t>(
+      sum >= mlkem::kModulus ? sum - mlkem::kModulus : sum);
+}
+
+__device__ __forceinline__ std::uint16_t kyber_sub(std::uint16_t a, std::uint16_t b) {
+  return static_cast<std::uint16_t>(
+      a >= b ? a - b : mlkem::kModulus + static_cast<std::uint32_t>(a) - b);
+}
+
+__device__ __forceinline__ std::uint16_t kyber_mul(std::uint16_t a, std::uint16_t b) {
+  return static_cast<std::uint16_t>(
+      (static_cast<std::uint32_t>(a) * b) % mlkem::kModulus);
+}
+
+__device__ std::uint16_t kyber_pow(std::uint16_t base, std::uint32_t exp) {
+  std::uint16_t result = 1;
+  while (exp != 0) {
+    if ((exp & 1U) != 0) {
+      result = kyber_mul(result, base);
+    }
+    base = kyber_mul(base, base);
+    exp >>= 1U;
+  }
+  return result;
+}
+
+__global__ void kyber_bit_reverse_kernel(std::uint16_t* values) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= mlkem::kPolyDegree) {
+    return;
+  }
+  const std::size_t j = __brev(static_cast<unsigned int>(i)) >> 24U;
+  if (i < j) {
+    const std::uint16_t tmp = values[i];
+    values[i] = values[j];
+    values[j] = tmp;
+  }
+}
+
+__global__ void kyber_twiddle_kernel(std::uint16_t* twiddles,
+                                     std::size_t half,
+                                     std::uint16_t w_len) {
+  const std::size_t j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < half) {
+    twiddles[j] = kyber_pow(w_len, static_cast<std::uint32_t>(j));
+  }
+}
+
+__global__ void kyber_ntt_stage_kernel(std::uint16_t* values,
+                                       std::size_t len,
+                                       const std::uint16_t* twiddles) {
+  const std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= mlkem::kPolyDegree / 2) {
+    return;
+  }
+
+  const std::size_t half = len / 2;
+  const std::size_t j = tid & (half - 1);
+  const std::size_t i = ((tid - j) << 1U) + j;
+
+  const std::uint16_t u = values[i];
+  const std::uint16_t v = kyber_mul(values[i + half], twiddles[j]);
+  values[i] = kyber_add(u, v);
+  values[i + half] = kyber_sub(u, v);
+}
+
+__global__ void kyber_pointwise_mul_kernel(const std::uint16_t* a,
+                                           const std::uint16_t* b,
+                                           std::uint16_t* out) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < mlkem::kPolyDegree) {
+    out[i] = kyber_mul(a[i], b[i]);
+  }
+}
+
+__global__ void kyber_scale_kernel(std::uint16_t* values, std::uint16_t scalar) {
+  const std::size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < mlkem::kPolyDegree) {
+    values[i] = kyber_mul(values[i], scalar);
+  }
+}
+
+__global__ void kyber_batched_bit_reverse_kernel(std::uint16_t* values,
+                                                 std::size_t batch) {
+  const std::size_t poly_idx = blockIdx.x;
+  const std::size_t i = threadIdx.x;
+  if (poly_idx >= batch || i >= mlkem::kPolyDegree) {
+    return;
+  }
+
+  std::uint16_t* poly = values + poly_idx * mlkem::kPolyDegree;
+  const std::size_t j = __brev(static_cast<unsigned int>(i)) >> 24U;
+  if (i < j) {
+    const std::uint16_t tmp = poly[i];
+    poly[i] = poly[j];
+    poly[j] = tmp;
+  }
+}
+
+__global__ void kyber_batched_ntt_stage_kernel(std::uint16_t* values,
+                                               std::size_t batch,
+                                               std::size_t len,
+                                               const std::uint16_t* twiddles) {
+  const std::size_t poly_idx = blockIdx.x;
+  const std::size_t tid = threadIdx.x;
+  if (poly_idx >= batch || tid >= mlkem::kPolyDegree / 2) {
+    return;
+  }
+
+  std::uint16_t* poly = values + poly_idx * mlkem::kPolyDegree;
+  const std::size_t half = len / 2;
+  const std::size_t j = tid & (half - 1);
+  const std::size_t i = ((tid - j) << 1U) + j;
+
+  const std::uint16_t u = poly[i];
+  const std::uint16_t v = kyber_mul(poly[i + half], twiddles[j]);
+  poly[i] = kyber_add(u, v);
+  poly[i + half] = kyber_sub(u, v);
+}
+
+__global__ void kyber_batched_pointwise_mul_kernel(const std::uint16_t* a,
+                                                   const std::uint16_t* b,
+                                                   std::uint16_t* out,
+                                                   std::size_t batch) {
+  const std::size_t poly_idx = blockIdx.x;
+  const std::size_t i = threadIdx.x;
+  if (poly_idx >= batch || i >= mlkem::kPolyDegree) {
+    return;
+  }
+  const std::size_t offset = poly_idx * mlkem::kPolyDegree + i;
+  out[offset] = kyber_mul(a[offset], b[offset]);
+}
+
+__global__ void kyber_batched_scale_kernel(std::uint16_t* values,
+                                           std::size_t batch,
+                                           std::uint16_t scalar) {
+  const std::size_t poly_idx = blockIdx.x;
+  const std::size_t i = threadIdx.x;
+  if (poly_idx < batch && i < mlkem::kPolyDegree) {
+    values[poly_idx * mlkem::kPolyDegree + i] =
+        kyber_mul(values[poly_idx * mlkem::kPolyDegree + i], scalar);
+  }
+}
+
+void kyber_ntt_device(std::uint16_t* d_values,
+                      std::uint16_t* d_twiddles,
+                      bool inverse) {
+  constexpr int kBlockSize = 256;
+  kyber_bit_reverse_kernel<<<1, kBlockSize>>>(d_values);
+  check(cudaGetLastError(), "kyber_bit_reverse_kernel");
+  check(cudaDeviceSynchronize(), "kyber bit reverse synchronize");
+
+  for (std::size_t len = 2; len <= mlkem::kPolyDegree; len <<= 1U) {
+    std::uint16_t w_len = mlkem::pow_mod(
+        mlkem::kPrimitiveRoot256,
+        static_cast<std::uint32_t>(mlkem::kPolyDegree / len));
+    if (inverse) {
+      w_len = mlkem::pow_mod(w_len, mlkem::kModulus - 2);
+    }
+
+    const std::size_t half = len / 2;
+    kyber_twiddle_kernel<<<1, kBlockSize>>>(d_twiddles, half, w_len);
+    check(cudaGetLastError(), "kyber_twiddle_kernel");
+    check(cudaDeviceSynchronize(), "kyber twiddle synchronize");
+
+    kyber_ntt_stage_kernel<<<1, kBlockSize>>>(d_values, len, d_twiddles);
+    check(cudaGetLastError(), "kyber_ntt_stage_kernel");
+    check(cudaDeviceSynchronize(), "kyber ntt stage synchronize");
+  }
+
+  if (inverse) {
+    const std::uint16_t inv_n = mlkem::pow_mod(
+        static_cast<std::uint16_t>(mlkem::kPolyDegree), mlkem::kModulus - 2);
+    kyber_scale_kernel<<<1, kBlockSize>>>(d_values, inv_n);
+    check(cudaGetLastError(), "kyber_scale_kernel");
+    check(cudaDeviceSynchronize(), "kyber scale synchronize");
+  }
+}
+
+void kyber_ntt_batch_device(std::uint16_t* d_values,
+                            std::size_t batch,
+                            std::uint16_t* d_twiddles,
+                            bool inverse) {
+  if (batch == 0) {
+    return;
+  }
+
+  constexpr int kFullBlockSize = 256;
+  constexpr int kButterflyBlockSize = 128;
+  kyber_batched_bit_reverse_kernel<<<static_cast<unsigned int>(batch), kFullBlockSize>>>(
+      d_values, batch);
+  check(cudaGetLastError(), "kyber_batched_bit_reverse_kernel");
+  check(cudaDeviceSynchronize(), "kyber batched bit reverse synchronize");
+
+  for (std::size_t len = 2; len <= mlkem::kPolyDegree; len <<= 1U) {
+    std::uint16_t w_len = mlkem::pow_mod(
+        mlkem::kPrimitiveRoot256,
+        static_cast<std::uint32_t>(mlkem::kPolyDegree / len));
+    if (inverse) {
+      w_len = mlkem::pow_mod(w_len, mlkem::kModulus - 2);
+    }
+
+    const std::size_t half = len / 2;
+    kyber_twiddle_kernel<<<1, kFullBlockSize>>>(d_twiddles, half, w_len);
+    check(cudaGetLastError(), "kyber_twiddle_kernel batch");
+    check(cudaDeviceSynchronize(), "kyber batched twiddle synchronize");
+
+    kyber_batched_ntt_stage_kernel<<<static_cast<unsigned int>(batch),
+                                      kButterflyBlockSize>>>(
+        d_values, batch, len, d_twiddles);
+    check(cudaGetLastError(), "kyber_batched_ntt_stage_kernel");
+    check(cudaDeviceSynchronize(), "kyber batched ntt stage synchronize");
+  }
+
+  if (inverse) {
+    const std::uint16_t inv_n = mlkem::pow_mod(
+        static_cast<std::uint16_t>(mlkem::kPolyDegree), mlkem::kModulus - 2);
+    kyber_batched_scale_kernel<<<static_cast<unsigned int>(batch), kFullBlockSize>>>(
+        d_values, batch, inv_n);
+    check(cudaGetLastError(), "kyber_batched_scale_kernel");
+    check(cudaDeviceSynchronize(), "kyber batched scale synchronize");
+  }
+}
+
 }  // namespace
 
 bool is_available() {
@@ -479,6 +706,104 @@ Sha256Digest merkle_root(const std::vector<std::uint64_t>& leaves) {
   cudaFree(d_current);
   cudaFree(d_next);
   return root;
+}
+
+mlkem::Poly mlkem_poly_mul_ntt(const mlkem::Poly& a, const mlkem::Poly& b) {
+  std::uint16_t* d_a = nullptr;
+  std::uint16_t* d_b = nullptr;
+  std::uint16_t* d_out = nullptr;
+  std::uint16_t* d_twiddles = nullptr;
+  constexpr std::size_t kBytes = mlkem::kPolyDegree * sizeof(std::uint16_t);
+
+  check(cudaMalloc(&d_a, kBytes), "cudaMalloc mlkem a");
+  check(cudaMalloc(&d_b, kBytes), "cudaMalloc mlkem b");
+  check(cudaMalloc(&d_out, kBytes), "cudaMalloc mlkem out");
+  check(cudaMalloc(&d_twiddles, (mlkem::kPolyDegree / 2) * sizeof(std::uint16_t)),
+        "cudaMalloc mlkem twiddles");
+  check(cudaMemcpy(d_a, a.data(), kBytes, cudaMemcpyHostToDevice), "copy mlkem a");
+  check(cudaMemcpy(d_b, b.data(), kBytes, cudaMemcpyHostToDevice), "copy mlkem b");
+
+  kyber_ntt_device(d_a, d_twiddles, false);
+  kyber_ntt_device(d_b, d_twiddles, false);
+  kyber_pointwise_mul_kernel<<<1, 256>>>(d_a, d_b, d_out);
+  check(cudaGetLastError(), "kyber_pointwise_mul_kernel");
+  check(cudaDeviceSynchronize(), "kyber pointwise synchronize");
+  kyber_ntt_device(d_out, d_twiddles, true);
+
+  mlkem::Poly out{};
+  check(cudaMemcpy(out.data(), d_out, kBytes, cudaMemcpyDeviceToHost),
+        "copy mlkem output");
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_out);
+  cudaFree(d_twiddles);
+  return out;
+}
+
+std::vector<mlkem::Poly> mlkem_ntt_batch(const std::vector<mlkem::Poly>& polys,
+                                         bool inverse) {
+  if (polys.empty()) {
+    return {};
+  }
+
+  std::uint16_t* d_values = nullptr;
+  std::uint16_t* d_twiddles = nullptr;
+  const std::size_t bytes = polys.size() * sizeof(mlkem::Poly);
+  check(cudaMalloc(&d_values, bytes), "cudaMalloc mlkem ntt batch values");
+  check(cudaMalloc(&d_twiddles, (mlkem::kPolyDegree / 2) * sizeof(std::uint16_t)),
+        "cudaMalloc mlkem ntt batch twiddles");
+  check(cudaMemcpy(d_values, polys.data(), bytes, cudaMemcpyHostToDevice),
+        "copy mlkem ntt batch input");
+
+  kyber_ntt_batch_device(d_values, polys.size(), d_twiddles, inverse);
+
+  std::vector<mlkem::Poly> out(polys.size());
+  check(cudaMemcpy(out.data(), d_values, bytes, cudaMemcpyDeviceToHost),
+        "copy mlkem ntt batch output");
+  cudaFree(d_values);
+  cudaFree(d_twiddles);
+  return out;
+}
+
+std::vector<mlkem::Poly> mlkem_poly_mul_ntt_batch(
+    const std::vector<mlkem::Poly>& a,
+    const std::vector<mlkem::Poly>& b) {
+  if (a.size() != b.size()) {
+    throw std::invalid_argument("cuda::mlkem_poly_mul_ntt_batch input sizes differ");
+  }
+  if (a.empty()) {
+    return {};
+  }
+
+  std::uint16_t* d_a = nullptr;
+  std::uint16_t* d_b = nullptr;
+  std::uint16_t* d_out = nullptr;
+  std::uint16_t* d_twiddles = nullptr;
+  const std::size_t bytes = a.size() * sizeof(mlkem::Poly);
+  check(cudaMalloc(&d_a, bytes), "cudaMalloc mlkem batch a");
+  check(cudaMalloc(&d_b, bytes), "cudaMalloc mlkem batch b");
+  check(cudaMalloc(&d_out, bytes), "cudaMalloc mlkem batch out");
+  check(cudaMalloc(&d_twiddles, (mlkem::kPolyDegree / 2) * sizeof(std::uint16_t)),
+        "cudaMalloc mlkem batch twiddles");
+  check(cudaMemcpy(d_a, a.data(), bytes, cudaMemcpyHostToDevice), "copy mlkem batch a");
+  check(cudaMemcpy(d_b, b.data(), bytes, cudaMemcpyHostToDevice), "copy mlkem batch b");
+
+  kyber_ntt_batch_device(d_a, a.size(), d_twiddles, false);
+  kyber_ntt_batch_device(d_b, b.size(), d_twiddles, false);
+  kyber_batched_pointwise_mul_kernel<<<static_cast<unsigned int>(a.size()), 256>>>(
+      d_a, d_b, d_out, a.size());
+  check(cudaGetLastError(), "kyber_batched_pointwise_mul_kernel");
+  check(cudaDeviceSynchronize(), "kyber batched pointwise synchronize");
+  kyber_ntt_batch_device(d_out, a.size(), d_twiddles, true);
+
+  std::vector<mlkem::Poly> out(a.size());
+  check(cudaMemcpy(out.data(), d_out, bytes, cudaMemcpyDeviceToHost),
+        "copy mlkem batch output");
+  cudaFree(d_a);
+  cudaFree(d_b);
+  cudaFree(d_out);
+  cudaFree(d_twiddles);
+  return out;
 }
 
 }  // namespace cpb::cuda

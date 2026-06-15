@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "cpb/field.hpp"
+#include "cpb/mlkem.hpp"
 #include "cpb/merkle.hpp"
 #include "cpb/ntt.hpp"
 #include "cpb/vector_ops.hpp"
@@ -53,6 +54,26 @@ void print_row(const std::string& backend,
             << std::setw(14) << std::setprecision(2) << throughput << " |\n";
 }
 
+void print_mlkem_row(const std::string& backend,
+                     const std::string& primitive,
+                     const std::string& workload,
+                     double ms,
+                     double throughput) {
+  std::cout << "| " << std::left << std::setw(6) << backend << " | " << std::setw(19)
+            << primitive << " | " << std::setw(12) << workload << " | "
+            << std::right << std::setw(10) << std::fixed << std::setprecision(3) << ms
+            << " | " << std::setw(18) << std::setprecision(3) << throughput << " |\n";
+}
+
+std::vector<cpb::mlkem::Poly> deterministic_poly_batch(std::size_t batch,
+                                                       std::uint32_t seed) {
+  std::vector<cpb::mlkem::Poly> out(batch);
+  for (std::size_t i = 0; i < batch; ++i) {
+    out[i] = cpb::mlkem::deterministic_poly(seed + static_cast<std::uint32_t>(i));
+  }
+  return out;
+}
+
 void run_cpu_benchmarks() {
   for (const std::size_t n : {1024UL, 4096UL, 16384UL, 65536UL}) {
     const auto a = deterministic_values(n, 1);
@@ -86,6 +107,15 @@ void run_cpu_benchmarks() {
     }, 3);
     print_row("CPU", "merkle sha256", n, ms, (static_cast<double>(n) / ms) / 1000.0);
   }
+}
+
+void run_mlkem_cpu_benchmarks() {
+  const auto poly = cpb::mlkem::deterministic_poly(501);
+  const double ms = time_ms([&] {
+    const auto out = cpb::mlkem::ntt(poly);
+    g_sink ^= out.front();
+  }, 1000);
+  print_mlkem_row("CPU", "ML-KEM NTT", "n=256", ms, 1.0 / ms);
 }
 
 void run_cuda_benchmarks() {
@@ -132,6 +162,43 @@ void run_cuda_benchmarks() {
 #endif
 }
 
+void run_mlkem_cuda_benchmarks() {
+#ifdef CPB_WITH_CUDA
+  if (!cpb::cuda::is_available()) {
+    std::cout << "\nCUDA backend was built, but no CUDA device is visible. "
+                 "Skipping ML-KEM GPU rows.\n";
+    return;
+  }
+
+  for (const std::size_t batch_size : {1UL, 1024UL, 10000UL, 100000UL}) {
+    const auto batch = deterministic_poly_batch(batch_size, 701);
+    const int iterations = batch_size <= 1024 ? 10 : 3;
+    const double batch_ntt_ms = time_ms([&] {
+      const auto out = cpb::cuda::mlkem_ntt_batch(batch);
+      g_sink ^= out.front().front();
+    }, iterations);
+    print_mlkem_row("CUDA", "ML-KEM NTT",
+                    "batch=" + std::to_string(batch_size), batch_ntt_ms,
+                    static_cast<double>(batch_size) / batch_ntt_ms);
+  }
+
+  for (const std::size_t batch_size : {1UL, 1024UL, 10000UL, 100000UL}) {
+    const auto batch_a = deterministic_poly_batch(batch_size, 1701);
+    const auto batch_b = deterministic_poly_batch(batch_size, 2701);
+    const int iterations = batch_size <= 1024 ? 5 : 3;
+    const double batch_mul_ms = time_ms([&] {
+      const auto out = cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, batch_b);
+      g_sink ^= out.front().front();
+    }, iterations);
+    print_mlkem_row("CUDA", "ML-KEM poly mul",
+                    "batch=" + std::to_string(batch_size), batch_mul_ms,
+                    static_cast<double>(batch_size) / batch_mul_ms);
+  }
+#else
+  std::cout << "\nBuilt without CUDA. Reconfigure on a CUDA machine for ML-KEM GPU rows.\n";
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -142,6 +209,13 @@ int main() {
     std::cout << "|--------:|---------------|---------:|-----------:|-----------------:|\n";
     run_cpu_benchmarks();
     run_cuda_benchmarks();
+
+    std::cout << "\nML-KEM/Kyber-style batched benchmark\n";
+    std::cout << "Modulus: q = 3329, degree n = 256, primitive 256th root = 17\n\n";
+    std::cout << "| Backend | Primitive           | Workload     |  Time (ms) | Throughput Kpoly/s |\n";
+    std::cout << "|--------:|---------------------|--------------|-----------:|-------------------:|\n";
+    run_mlkem_cpu_benchmarks();
+    run_mlkem_cuda_benchmarks();
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Benchmark failed: " << e.what() << '\n';

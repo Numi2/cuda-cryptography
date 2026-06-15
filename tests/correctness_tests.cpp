@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "cpb/field.hpp"
+#include "cpb/mlkem.hpp"
 #include "cpb/merkle.hpp"
 #include "cpb/ntt.hpp"
 #include "cpb/sha256.hpp"
@@ -74,6 +75,35 @@ bool expect_equal(const cpb::Sha256Digest& expected,
   return true;
 }
 
+bool expect_equal(const cpb::mlkem::Poly& expected,
+                  const cpb::mlkem::Poly& actual,
+                  const std::string& name) {
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] != actual[i]) {
+      std::cerr << name << " first mismatch at coefficient " << i << ": expected "
+                << expected[i] << ", got " << actual[i] << '\n';
+      return false;
+    }
+  }
+  return true;
+}
+
+bool expect_equal(const std::vector<cpb::mlkem::Poly>& expected,
+                  const std::vector<cpb::mlkem::Poly>& actual,
+                  const std::string& name) {
+  if (expected.size() != actual.size()) {
+    std::cerr << name << " batch size mismatch: expected " << expected.size()
+              << ", got " << actual.size() << '\n';
+    return false;
+  }
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (!expect_equal(expected[i], actual[i], name + " poly=" + std::to_string(i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool test_field_vectors() {
   const std::uint64_t p = cpb::field::kModulus;
   bool ok = true;
@@ -131,6 +161,50 @@ bool test_cpu_primitives() {
   return ok;
 }
 
+bool test_mlkem_cpu_primitives() {
+  bool ok = true;
+  ok &= cpb::mlkem::kModulus == 3329;
+  ok &= cpb::mlkem::pow_mod(cpb::mlkem::kPrimitiveRoot256, 256) == 1;
+  ok &= cpb::mlkem::pow_mod(cpb::mlkem::kPrimitiveRoot256, 128) ==
+        cpb::mlkem::kModulus - 1;
+
+  const auto a = cpb::mlkem::deterministic_poly(123);
+  const auto b = cpb::mlkem::deterministic_poly(456);
+  const std::array<std::uint16_t, 8> expected_a = {
+      426, 1911, 1974, 179, 329, 2496, 2804, 328};
+  const std::array<std::uint16_t, 8> expected_b = {
+      2093, 617, 1521, 25, 919, 2890, 1385, 356};
+  for (std::size_t i = 0; i < expected_a.size(); ++i) {
+    ok &= a[i] == expected_a[i];
+    ok &= b[i] == expected_b[i];
+  }
+
+  const auto roundtrip = cpb::mlkem::ntt(cpb::mlkem::ntt(a), true);
+  ok &= expect_equal(a, roundtrip, "mlkem cpu ntt roundtrip");
+
+  const auto schoolbook = cpb::mlkem::poly_mul_schoolbook(a, b);
+  const auto ntt = cpb::mlkem::poly_mul_ntt(a, b);
+  ok &= expect_equal(schoolbook, ntt, "mlkem cpu ntt mul");
+
+  const std::array<std::uint16_t, 16> expected_product = {
+      2684, 2203, 3003, 2843, 2176, 2360, 2144, 943,
+      1820, 2594, 2416, 2662, 369, 3155, 2020, 2920};
+  for (std::size_t i = 0; i < expected_product.size(); ++i) {
+    if (schoolbook[i] != expected_product[i]) {
+      std::cerr << "mlkem deterministic product mismatch at coefficient " << i
+                << ": expected " << expected_product[i] << ", got " << schoolbook[i]
+                << '\n';
+      ok = false;
+      break;
+    }
+  }
+
+  if (!ok) {
+    std::cerr << "ML-KEM-style CPU primitive test failed\n";
+  }
+  return ok;
+}
+
 bool test_cuda_primitives() {
 #ifdef CPB_WITH_CUDA
   if (!cpb::cuda::is_available()) {
@@ -159,6 +233,27 @@ bool test_cuda_primitives() {
   const auto leaves = deterministic_values(2048, 31);
   ok &= expect_equal(cpb::merkle_root_cpu(leaves), cpb::cuda::merkle_root(leaves),
                      "cuda merkle root");
+
+  const auto mlkem_a = cpb::mlkem::deterministic_poly(123);
+  const auto mlkem_b = cpb::mlkem::deterministic_poly(456);
+  ok &= expect_equal(cpb::mlkem::poly_mul_ntt(mlkem_a, mlkem_b),
+                     cpb::cuda::mlkem_poly_mul_ntt(mlkem_a, mlkem_b),
+                     "cuda mlkem single poly mul");
+
+  std::vector<cpb::mlkem::Poly> batch_a(32);
+  std::vector<cpb::mlkem::Poly> batch_b(32);
+  std::vector<cpb::mlkem::Poly> expected_ntt(32);
+  std::vector<cpb::mlkem::Poly> expected_mul(32);
+  for (std::size_t i = 0; i < batch_a.size(); ++i) {
+    batch_a[i] = cpb::mlkem::deterministic_poly(static_cast<std::uint32_t>(1000 + i));
+    batch_b[i] = cpb::mlkem::deterministic_poly(static_cast<std::uint32_t>(2000 + i));
+    expected_ntt[i] = cpb::mlkem::ntt(batch_a[i]);
+    expected_mul[i] = cpb::mlkem::poly_mul_ntt(batch_a[i], batch_b[i]);
+  }
+  ok &= expect_equal(expected_ntt, cpb::cuda::mlkem_ntt_batch(batch_a),
+                     "cuda mlkem ntt batch");
+  ok &= expect_equal(expected_mul, cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, batch_b),
+                     "cuda mlkem poly mul batch");
   return ok;
 #else
   std::cout << "Built without CUDA; CPU correctness checks completed\n";
@@ -174,6 +269,7 @@ int main() {
     ok &= test_field_vectors();
     ok &= test_sha256_vectors();
     ok &= test_cpu_primitives();
+    ok &= test_mlkem_cpu_primitives();
     ok &= test_cuda_primitives();
 
     if (!ok) {
