@@ -1,15 +1,18 @@
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cpb/field.hpp"
 #include "cpb/mlkem.hpp"
 #include "cpb/merkle.hpp"
 #include "cpb/ntt.hpp"
+#include "cpb/poseidon2_merkle.hpp"
 #include "cpb/vector_ops.hpp"
 
 #ifdef CPB_WITH_CUDA
@@ -63,6 +66,32 @@ void print_mlkem_row(const std::string& backend,
             << primitive << " | " << std::setw(12) << workload << " | "
             << std::right << std::setw(10) << std::fixed << std::setprecision(3) << ms
             << " | " << std::setw(18) << std::setprecision(3) << throughput << " |\n";
+}
+
+void print_poseidon2_row(const std::string& backend,
+                         const std::string& workload,
+                         double host_ms,
+                         double device_ms,
+                         std::size_t hashes,
+                         std::size_t bytes_absorbed) {
+  const double host_hashes_s = static_cast<double>(hashes) / (host_ms / 1000.0);
+  const double host_gbs = (static_cast<double>(bytes_absorbed) / (1024.0 * 1024.0 * 1024.0)) /
+                          (host_ms / 1000.0);
+  const double device_hashes_s =
+      device_ms > 0.0 ? static_cast<double>(hashes) / (device_ms / 1000.0) : 0.0;
+  const double device_gbs =
+      device_ms > 0.0
+          ? (static_cast<double>(bytes_absorbed) / (1024.0 * 1024.0 * 1024.0)) /
+                (device_ms / 1000.0)
+          : 0.0;
+
+  std::cout << "| " << std::left << std::setw(6) << backend << " | " << std::setw(22)
+            << workload << " | " << std::right << std::setw(10) << std::fixed
+            << std::setprecision(3) << host_ms << " | " << std::setw(12)
+            << device_ms << " | " << std::setw(15) << std::setprecision(2)
+            << (host_hashes_s / 1.0e6) << " | " << std::setw(11) << host_gbs
+            << " | " << std::setw(17) << (device_hashes_s / 1.0e6) << " | "
+            << std::setw(13) << device_gbs << " |\n";
 }
 
 std::vector<cpb::mlkem::Poly> deterministic_poly_batch(std::size_t batch,
@@ -199,6 +228,62 @@ void run_mlkem_cuda_benchmarks() {
 #endif
 }
 
+void run_poseidon2_cpu_benchmarks() {
+  const bool full_cpu = std::getenv("CPB_POSEIDON2_FULL_CPU") != nullptr;
+  const std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>> shapes = {
+      {"1 x 2^10 leaves", {1, 1UL << 10}},
+      {"1 x 2^20 leaves", {1, 1UL << 20}},
+      {"1024 x 2^10", {1024, 1UL << 10}},
+      {"65536 x 16", {65536, 16}},
+  };
+
+  for (std::size_t i = 0; i < shapes.size(); ++i) {
+    if (i != 0 && !full_cpu) {
+      continue;
+    }
+    const auto& [label, shape] = shapes[i];
+    const auto leaves = cpb::poseidon2::deterministic_leaves(
+        shape.tree_count * shape.leaves_per_tree, 9000 + i);
+    const auto result = cpb::poseidon2::merkle_forest_roots_cpu(leaves, shape);
+    g_sink ^= result.roots.front().front();
+    print_poseidon2_row("CPU", label, result.host_ms, 0.0, result.hashes,
+                        result.bytes_absorbed);
+  }
+  if (!full_cpu) {
+    std::cout << "CPU full-size Poseidon2 forest rows skipped. Set "
+                 "CPB_POSEIDON2_FULL_CPU=1 to run them.\n";
+  }
+}
+
+void run_poseidon2_cuda_benchmarks() {
+#ifdef CPB_WITH_CUDA
+  if (!cpb::cuda::is_available()) {
+    std::cout << "\nCUDA backend was built, but no CUDA device is visible. "
+                 "Skipping Poseidon2 forest GPU rows.\n";
+    return;
+  }
+
+  const std::vector<std::pair<std::string, cpb::poseidon2::ForestShape>> shapes = {
+      {"1 x 2^20 leaves", {1, 1UL << 20}},
+      {"1024 x 2^10", {1024, 1UL << 10}},
+      {"65536 x 16", {65536, 16}},
+  };
+
+  for (std::size_t i = 0; i < shapes.size(); ++i) {
+    const auto& [label, shape] = shapes[i];
+    const auto leaves = cpb::poseidon2::deterministic_leaves(
+        shape.tree_count * shape.leaves_per_tree, 12000 + i);
+    const auto result = cpb::cuda::poseidon2_merkle_forest(leaves, shape);
+    g_sink ^= result.roots.front().front();
+    print_poseidon2_row("CUDA", label, result.host_ms, result.device_ms,
+                        result.hashes, result.bytes_absorbed);
+  }
+#else
+  std::cout << "\nBuilt without CUDA. Reconfigure on a CUDA machine for "
+               "Poseidon2 forest GPU rows.\n";
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -216,6 +301,14 @@ int main() {
     std::cout << "|--------:|---------------------|--------------|-----------:|-------------------:|\n";
     run_mlkem_cpu_benchmarks();
     run_mlkem_cuda_benchmarks();
+
+    std::cout << "\nPoseidon2-style Goldilocks Merkle forest benchmark\n";
+    std::cout << "Host time includes allocation, H2D/D2H transfer, kernels, and root copy. "
+                 "Device time is CUDA-event kernel time with leaves and levels resident.\n\n";
+    std::cout << "| Backend | Workload               | Host ms    | Device ms   | Host Mhash/s   | Host GB/s   | Device Mhash/s   | Device GB/s   |\n";
+    std::cout << "|--------:|------------------------|-----------:|------------:|---------------:|------------:|-----------------:|--------------:|\n";
+    run_poseidon2_cpu_benchmarks();
+    run_poseidon2_cuda_benchmarks();
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "Benchmark failed: " << e.what() << '\n';

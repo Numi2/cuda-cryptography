@@ -12,6 +12,7 @@
 #include "cpb/mlkem.hpp"
 #include "cpb/merkle.hpp"
 #include "cpb/ntt.hpp"
+#include "cpb/poseidon2_merkle.hpp"
 #include "cpb/sha256.hpp"
 #include "cpb/vector_ops.hpp"
 
@@ -98,6 +99,35 @@ bool expect_equal(const std::vector<cpb::mlkem::Poly>& expected,
   }
   for (std::size_t i = 0; i < expected.size(); ++i) {
     if (!expect_equal(expected[i], actual[i], name + " poly=" + std::to_string(i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool expect_equal(const cpb::poseidon2::Digest& expected,
+                  const cpb::poseidon2::Digest& actual,
+                  const std::string& name) {
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i] != actual[i]) {
+      std::cerr << name << " first mismatch at word " << i << ": expected "
+                << expected[i] << ", got " << actual[i] << '\n';
+      return false;
+    }
+  }
+  return true;
+}
+
+bool expect_equal(const std::vector<cpb::poseidon2::Digest>& expected,
+                  const std::vector<cpb::poseidon2::Digest>& actual,
+                  const std::string& name) {
+  if (expected.size() != actual.size()) {
+    std::cerr << name << " root count mismatch: expected " << expected.size()
+              << ", got " << actual.size() << '\n';
+    return false;
+  }
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (!expect_equal(expected[i], actual[i], name + " root=" + std::to_string(i))) {
       return false;
     }
   }
@@ -205,6 +235,41 @@ bool test_mlkem_cpu_primitives() {
   return ok;
 }
 
+bool test_poseidon2_merkle_cpu() {
+  const cpb::poseidon2::ForestShape shape{2, 8};
+  const auto leaves = cpb::poseidon2::deterministic_leaves(
+      shape.tree_count * shape.leaves_per_tree, 999);
+  const auto result = cpb::poseidon2::merkle_forest_roots_cpu(leaves, shape);
+
+  bool ok = true;
+  ok &= result.roots.size() == shape.tree_count;
+  ok &= result.hashes == cpb::poseidon2::merkle_hash_count(shape);
+  ok &= result.bytes_absorbed == cpb::poseidon2::absorbed_bytes_for_hashes(result.hashes);
+  const std::vector<cpb::poseidon2::Digest> expected_roots = {
+      {2833046405353280632ULL, 17455829047229495281ULL, 3448498022770064707ULL,
+       1737143749959670836ULL},
+      {7507967109803505144ULL, 8818948803314405175ULL, 18362079593053762419ULL,
+       837974301746350213ULL},
+  };
+  ok &= expect_equal(expected_roots, result.roots, "poseidon2 deterministic roots");
+
+  const auto path = cpb::poseidon2::merkle_auth_path_cpu(leaves, shape, 1, 5);
+  ok &= cpb::poseidon2::verify_auth_path_cpu(path);
+
+  const std::array<std::size_t, 4> trees = {0, 0, 1, 1};
+  const std::array<std::size_t, 4> indices = {0, 7, 2, 6};
+  const auto paths = cpb::poseidon2::merkle_auth_paths_cpu(leaves, shape, trees, indices);
+  ok &= paths.size() == trees.size();
+  for (const auto& auth_path : paths) {
+    ok &= cpb::poseidon2::verify_auth_path_cpu(auth_path);
+  }
+
+  if (!ok) {
+    std::cerr << "Poseidon2-style Merkle forest CPU test failed\n";
+  }
+  return ok;
+}
+
 bool test_cuda_primitives() {
 #ifdef CPB_WITH_CUDA
   if (!cpb::cuda::is_available()) {
@@ -254,6 +319,13 @@ bool test_cuda_primitives() {
                      "cuda mlkem ntt batch");
   ok &= expect_equal(expected_mul, cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, batch_b),
                      "cuda mlkem poly mul batch");
+
+  const cpb::poseidon2::ForestShape p2_shape{4, 16};
+  const auto p2_leaves = cpb::poseidon2::deterministic_leaves(
+      p2_shape.tree_count * p2_shape.leaves_per_tree, 12345);
+  const auto p2_cpu = cpb::poseidon2::merkle_forest_roots_cpu(p2_leaves, p2_shape);
+  const auto p2_cuda = cpb::cuda::poseidon2_merkle_forest(p2_leaves, p2_shape);
+  ok &= expect_equal(p2_cpu.roots, p2_cuda.roots, "cuda poseidon2 merkle forest");
   return ok;
 #else
   std::cout << "Built without CUDA; CPU correctness checks completed\n";
@@ -270,6 +342,7 @@ int main() {
     ok &= test_sha256_vectors();
     ok &= test_cpu_primitives();
     ok &= test_mlkem_cpu_primitives();
+    ok &= test_poseidon2_merkle_cpu();
     ok &= test_cuda_primitives();
 
     if (!ok) {

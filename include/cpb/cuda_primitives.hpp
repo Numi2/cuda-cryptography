@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "cpb/mlkem.hpp"
+#include "cpb/poseidon2_merkle.hpp"
 #include "cpb/sha256.hpp"
 
 namespace cpb::cuda {
@@ -29,5 +30,9 @@ std::vector<mlkem::Poly> mlkem_ntt_batch(const std::vector<mlkem::Poly>& polys,
 std::vector<mlkem::Poly> mlkem_poly_mul_ntt_batch(
     const std::vector<mlkem::Poly>& a,
     const std::vector<mlkem::Poly>& b);
+
+poseidon2::ForestBuildResult poseidon2_merkle_forest(
+    const std::vector<poseidon2::Leaf>& leaves,
+    poseidon2::ForestShape shape);
 
 }  // namespace cpb::cuda

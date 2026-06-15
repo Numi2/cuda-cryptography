@@ -42,3 +42,21 @@ CUDA field multiplication uses `__umul64hi` to recover the high half of the
 The NTT precomputes stage twiddle powers once per stage on the device instead of
 recomputing them for every butterfly. Future versions can replace repeated
 kernel launches and host-managed Merkle levels with more optimized designs.
+
+## Poseidon2 Merkle Forest
+
+The `poseidon2_merkle_forest` path uses a Poseidon2-style Goldilocks permutation
+with deterministic benchmark constants. It is intended for CUDA engineering
+benchmarks, not production cryptography. Leaves contain eight Goldilocks field
+elements, parent nodes absorb two four-word digests, and roots are four-word
+digests.
+
+The CUDA builder copies the input leaves once, hashes leaves into a device
+buffer, alternates device-resident current/next level buffers until roots
+remain, and copies only the final roots back. Benchmark output reports both
+host-transfer-included wall time and device-only CUDA event time.
+
+CPU proof-path generation builds a reference tree, emits sibling digests for
+selected leaves, and verifies the path back to the deterministic root. This
+keeps authentication logic auditable while the GPU path focuses on large forest
+construction throughput.

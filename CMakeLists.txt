@@ -37,6 +37,7 @@ add_library(cpb_core
   src/mlkem_cpu.cpp
   src/merkle_cpu.cpp
   src/ntt_cpu.cpp
+  src/poseidon2_merkle_cpu.cpp
   src/sha256.cpp
   src/vector_cpu.cpp)
 

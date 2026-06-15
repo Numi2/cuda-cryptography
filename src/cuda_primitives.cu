@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -11,6 +12,7 @@
 
 #include "cpb/field.hpp"
 #include "cpb/mlkem.hpp"
+#include "cpb/poseidon2_merkle.hpp"
 
 namespace cpb::cuda {
 
@@ -537,6 +539,125 @@ void kyber_ntt_batch_device(std::uint16_t* d_values,
   }
 }
 
+__device__ __forceinline__ std::uint64_t p2_splitmix64(std::uint64_t x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27U)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31U);
+}
+
+__device__ __forceinline__ std::uint64_t p2_round_constant(std::size_t round,
+                                                           std::size_t lane) {
+  const std::uint64_t seed = 0x706f736569646f6eULL ^
+                             (static_cast<std::uint64_t>(round) << 32U) ^
+                             static_cast<std::uint64_t>(lane);
+  return p2_splitmix64(seed) % kModulus;
+}
+
+__device__ __forceinline__ std::uint64_t p2_diagonal(std::size_t lane) {
+  return 2 + static_cast<std::uint64_t>((lane * 7) % 13);
+}
+
+__device__ __forceinline__ std::uint64_t p2_sbox(std::uint64_t x) {
+  const std::uint64_t x2 = d_mul(x, x);
+  const std::uint64_t x4 = d_mul(x2, x2);
+  return d_mul(d_mul(x4, x2), x);
+}
+
+__device__ void p2_mix(std::uint64_t state[poseidon2::kStateWidth]) {
+  std::uint64_t sum = 0;
+  for (std::size_t i = 0; i < poseidon2::kStateWidth; ++i) {
+    sum = d_add(sum, state[i]);
+  }
+  for (std::size_t i = 0; i < poseidon2::kStateWidth; ++i) {
+    state[i] = d_add(d_mul(state[i], p2_diagonal(i)), sum);
+  }
+}
+
+__device__ void p2_add_round_constants(std::uint64_t state[poseidon2::kStateWidth],
+                                       std::size_t round) {
+  for (std::size_t i = 0; i < poseidon2::kStateWidth; ++i) {
+    state[i] = d_add(state[i], p2_round_constant(round, i));
+  }
+}
+
+__device__ void p2_permute(std::uint64_t state[poseidon2::kStateWidth]) {
+  p2_mix(state);
+  std::size_t round = 0;
+  for (; round < poseidon2::kFullRounds / 2; ++round) {
+    p2_add_round_constants(state, round);
+    for (std::size_t i = 0; i < poseidon2::kStateWidth; ++i) {
+      state[i] = p2_sbox(state[i]);
+    }
+    p2_mix(state);
+  }
+  for (; round < poseidon2::kFullRounds / 2 + poseidon2::kPartialRounds; ++round) {
+    p2_add_round_constants(state, round);
+    state[0] = p2_sbox(state[0]);
+    p2_mix(state);
+  }
+  for (; round < poseidon2::kFullRounds + poseidon2::kPartialRounds; ++round) {
+    p2_add_round_constants(state, round);
+    for (std::size_t i = 0; i < poseidon2::kStateWidth; ++i) {
+      state[i] = p2_sbox(state[i]);
+    }
+    p2_mix(state);
+  }
+}
+
+__global__ void p2_leaf_kernel(const std::uint64_t* leaves,
+                               std::uint64_t* current,
+                               std::size_t total_leaves) {
+  const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_leaves) {
+    return;
+  }
+
+  std::uint64_t state[poseidon2::kStateWidth] = {};
+  const std::uint64_t* leaf = leaves + idx * poseidon2::kRateWords;
+  for (std::size_t i = 0; i < poseidon2::kRateWords; ++i) {
+    state[i] = leaf[i];
+  }
+  state[poseidon2::kRateWords] = 1;
+  p2_permute(state);
+
+  std::uint64_t* digest = current + idx * poseidon2::kDigestWords;
+  for (std::size_t i = 0; i < poseidon2::kDigestWords; ++i) {
+    digest[i] = state[i];
+  }
+}
+
+__global__ void p2_parent_kernel(const std::uint64_t* current,
+                                 std::uint64_t* next,
+                                 std::size_t tree_count,
+                                 std::size_t level_count) {
+  const std::size_t parents_per_tree = level_count / 2;
+  const std::size_t total_parents = tree_count * parents_per_tree;
+  const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_parents) {
+    return;
+  }
+
+  const std::size_t tree = idx / parents_per_tree;
+  const std::size_t parent = idx - tree * parents_per_tree;
+  const std::size_t left_idx = tree * level_count + 2 * parent;
+  const std::uint64_t* left = current + left_idx * poseidon2::kDigestWords;
+  const std::uint64_t* right = left + poseidon2::kDigestWords;
+
+  std::uint64_t state[poseidon2::kStateWidth] = {};
+  for (std::size_t i = 0; i < poseidon2::kDigestWords; ++i) {
+    state[i] = left[i];
+    state[i + poseidon2::kDigestWords] = right[i];
+  }
+  state[poseidon2::kRateWords] = 2;
+  p2_permute(state);
+
+  std::uint64_t* digest = next + idx * poseidon2::kDigestWords;
+  for (std::size_t i = 0; i < poseidon2::kDigestWords; ++i) {
+    digest[i] = state[i];
+  }
+}
+
 }  // namespace
 
 bool is_available() {
@@ -804,6 +925,82 @@ std::vector<mlkem::Poly> mlkem_poly_mul_ntt_batch(
   cudaFree(d_out);
   cudaFree(d_twiddles);
   return out;
+}
+
+poseidon2::ForestBuildResult poseidon2_merkle_forest(
+    const std::vector<poseidon2::Leaf>& leaves,
+    poseidon2::ForestShape shape) {
+  if (shape.tree_count == 0 || shape.leaves_per_tree == 0 ||
+      (shape.leaves_per_tree & (shape.leaves_per_tree - 1)) != 0) {
+    throw std::invalid_argument("poseidon2 CUDA forest shape must use power-of-two trees");
+  }
+  const std::size_t total_leaves = shape.tree_count * shape.leaves_per_tree;
+  if (leaves.size() != total_leaves) {
+    throw std::invalid_argument("poseidon2 CUDA leaf count does not match forest shape");
+  }
+
+  const auto host_start = std::chrono::steady_clock::now();
+
+  std::uint64_t* d_leaves = nullptr;
+  std::uint64_t* d_current = nullptr;
+  std::uint64_t* d_next = nullptr;
+  const std::size_t leaf_bytes = leaves.size() * sizeof(poseidon2::Leaf);
+  const std::size_t max_digest_bytes =
+      total_leaves * poseidon2::kDigestWords * sizeof(std::uint64_t);
+  check(cudaMalloc(&d_leaves, leaf_bytes), "cudaMalloc poseidon2 leaves");
+  check(cudaMalloc(&d_current, max_digest_bytes), "cudaMalloc poseidon2 current");
+  check(cudaMalloc(&d_next, max_digest_bytes / 2), "cudaMalloc poseidon2 next");
+  check(cudaMemcpy(d_leaves, leaves.data(), leaf_bytes, cudaMemcpyHostToDevice),
+        "copy poseidon2 leaves");
+
+  cudaEvent_t device_start = nullptr;
+  cudaEvent_t device_end = nullptr;
+  check(cudaEventCreate(&device_start), "create poseidon2 device start event");
+  check(cudaEventCreate(&device_end), "create poseidon2 device end event");
+  check(cudaEventRecord(device_start), "record poseidon2 device start");
+
+  constexpr int kBlockSize = 256;
+  int blocks = static_cast<int>((total_leaves + kBlockSize - 1) / kBlockSize);
+  p2_leaf_kernel<<<blocks, kBlockSize>>>(d_leaves, d_current, total_leaves);
+  check(cudaGetLastError(), "p2_leaf_kernel");
+
+  std::size_t level_count = shape.leaves_per_tree;
+  while (level_count > 1) {
+    const std::size_t total_parents = shape.tree_count * (level_count / 2);
+    blocks = static_cast<int>((total_parents + kBlockSize - 1) / kBlockSize);
+    p2_parent_kernel<<<blocks, kBlockSize>>>(d_current, d_next, shape.tree_count,
+                                             level_count);
+    check(cudaGetLastError(), "p2_parent_kernel");
+    std::swap(d_current, d_next);
+    level_count >>= 1U;
+  }
+
+  check(cudaEventRecord(device_end), "record poseidon2 device end");
+  check(cudaEventSynchronize(device_end), "synchronize poseidon2 device end");
+  float device_ms = 0.0F;
+  check(cudaEventElapsedTime(&device_ms, device_start, device_end),
+        "elapsed poseidon2 device time");
+
+  poseidon2::ForestBuildResult result;
+  result.roots.resize(shape.tree_count);
+  check(cudaMemcpy(result.roots.data(), d_current,
+                   shape.tree_count * sizeof(poseidon2::Digest),
+                   cudaMemcpyDeviceToHost),
+        "copy poseidon2 roots");
+
+  const auto host_end = std::chrono::steady_clock::now();
+  result.host_ms =
+      std::chrono::duration<double, std::milli>(host_end - host_start).count();
+  result.device_ms = static_cast<double>(device_ms);
+  result.hashes = poseidon2::merkle_hash_count(shape);
+  result.bytes_absorbed = poseidon2::absorbed_bytes_for_hashes(result.hashes);
+
+  cudaEventDestroy(device_start);
+  cudaEventDestroy(device_end);
+  cudaFree(d_leaves);
+  cudaFree(d_current);
+  cudaFree(d_next);
+  return result;
 }
 
 }  // namespace cpb::cuda
