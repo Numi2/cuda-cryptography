@@ -37,7 +37,8 @@ The CUDA path mirrors the CPU path:
 - Merkle hashing uses one thread per leaf or parent hash.
 
 The CUDA code deliberately favors readability over aggressive optimization.
-CUDA field multiplication currently uses a portable modular double-and-add
-routine to avoid compiler-specific 128-bit device integer support. Future
-versions can replace that, per-thread root exponentiation, repeated kernel
-launches, and host-managed Merkle levels with more optimized designs.
+CUDA field multiplication uses `__umul64hi` to recover the high half of the
+64x64 product, then folds with the Goldilocks identity `2^64 = 2^32 - 1 mod p`.
+The NTT precomputes stage twiddle powers once per stage on the device instead of
+recomputing them for every butterfly. Future versions can replace repeated
+kernel launches and host-managed Merkle levels with more optimized designs.

@@ -16,7 +16,6 @@ namespace cpb::cuda {
 namespace {
 
 constexpr std::uint64_t kModulus = field::kModulus;
-constexpr std::uint64_t kPrimitiveRoot = field::kPrimitiveRoot;
 
 void check(cudaError_t err, const char* context) {
   if (err != cudaSuccess) {
@@ -24,7 +23,7 @@ void check(cudaError_t err, const char* context) {
   }
 }
 
-__device__ std::uint64_t d_add(std::uint64_t a, std::uint64_t b) {
+__device__ __forceinline__ std::uint64_t d_add(std::uint64_t a, std::uint64_t b) {
   const std::uint64_t sum = a + b;
   if (sum < a || sum >= kModulus) {
     return sum - kModulus;
@@ -32,22 +31,40 @@ __device__ std::uint64_t d_add(std::uint64_t a, std::uint64_t b) {
   return sum;
 }
 
-__device__ std::uint64_t d_sub(std::uint64_t a, std::uint64_t b) {
+__device__ __forceinline__ std::uint64_t d_sub(std::uint64_t a, std::uint64_t b) {
   return (a >= b) ? (a - b) : (kModulus - (b - a));
 }
 
-__device__ std::uint64_t d_mul(std::uint64_t a, std::uint64_t b) {
-  std::uint64_t result = 0;
-  while (b != 0) {
-    if ((b & 1U) != 0) {
-      result = d_add(result, a);
-    }
-    b >>= 1U;
-    if (b != 0) {
-      a = d_add(a, a);
-    }
+__device__ __forceinline__ void goldilocks_fold_once(std::uint64_t& lo,
+                                                     std::uint64_t& hi) {
+  std::uint64_t term_lo = hi << 32U;
+  std::uint64_t term_hi = hi >> 32U;
+  const std::uint64_t borrow = term_lo < hi ? 1ULL : 0ULL;
+  term_lo -= hi;
+  term_hi -= borrow;
+
+  const std::uint64_t sum = lo + term_lo;
+  const std::uint64_t carry = sum < lo ? 1ULL : 0ULL;
+  lo = sum;
+  hi = term_hi + carry;
+}
+
+__device__ __forceinline__ std::uint64_t d_mul(std::uint64_t a, std::uint64_t b) {
+  std::uint64_t lo = a * b;
+  std::uint64_t hi = __umul64hi(a, b);
+
+  // For p = 2^64 - 2^32 + 1, 2^64 == 2^32 - 1 mod p.
+  goldilocks_fold_once(lo, hi);
+  goldilocks_fold_once(lo, hi);
+  goldilocks_fold_once(lo, hi);
+
+  if (lo >= kModulus) {
+    lo -= kModulus;
   }
-  return result;
+  if (lo >= kModulus) {
+    lo -= kModulus;
+  }
+  return lo;
 }
 
 __device__ std::uint64_t d_pow(std::uint64_t base, std::uint64_t exp) {
@@ -83,12 +100,7 @@ __global__ void vector_mul_kernel(const std::uint64_t* a,
 }
 
 __device__ std::size_t reverse_bits(std::size_t value, int bits) {
-  std::size_t out = 0;
-  for (int i = 0; i < bits; ++i) {
-    out = (out << 1U) | (value & 1U);
-    value >>= 1U;
-  }
-  return out;
+  return __brevll(static_cast<unsigned long long>(value)) >> (64 - bits);
 }
 
 __global__ void bit_reverse_kernel(std::uint64_t* values, std::size_t n, int bits) {
@@ -107,7 +119,7 @@ __global__ void bit_reverse_kernel(std::uint64_t* values, std::size_t n, int bit
 __global__ void ntt_stage_kernel(std::uint64_t* values,
                                  std::size_t n,
                                  std::size_t len,
-                                 std::uint64_t w_len) {
+                                 const std::uint64_t* twiddles) {
   const std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t butterflies = n / 2;
   if (tid >= butterflies) {
@@ -115,15 +127,23 @@ __global__ void ntt_stage_kernel(std::uint64_t* values,
   }
 
   const std::size_t half = len / 2;
-  const std::size_t group = tid / half;
-  const std::size_t j = tid - group * half;
-  const std::size_t i = group * len + j;
+  const std::size_t j = tid & (half - 1);
+  const std::size_t i = ((tid - j) << 1U) + j;
 
-  const std::uint64_t w = d_pow(w_len, j);
+  const std::uint64_t w = twiddles[j];
   const std::uint64_t u = values[i];
   const std::uint64_t v = d_mul(values[i + half], w);
   values[i] = d_add(u, v);
   values[i + half] = d_sub(u, v);
+}
+
+__global__ void twiddle_kernel(std::uint64_t* twiddles,
+                               std::size_t half,
+                               std::uint64_t w_len) {
+  const std::size_t j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < half) {
+    twiddles[j] = d_pow(w_len, j);
+  }
 }
 
 __global__ void scale_kernel(std::uint64_t* values, std::size_t n, std::uint64_t scalar) {
@@ -366,10 +386,16 @@ std::vector<std::uint64_t> vector_mul(const std::vector<std::uint64_t>& a,
 std::vector<std::uint64_t> ntt(const std::vector<std::uint64_t>& values, bool inverse) {
   const std::size_t n = values.size();
   const std::size_t bits = field::log2_exact(n);
+  if (n == 1) {
+    return values;
+  }
 
   std::uint64_t* d_values = nullptr;
+  std::uint64_t* d_twiddles = nullptr;
   const std::size_t bytes = n * sizeof(std::uint64_t);
   check(cudaMalloc(&d_values, bytes), "cudaMalloc ntt values");
+  check(cudaMalloc(&d_twiddles, (n / 2) * sizeof(std::uint64_t)),
+        "cudaMalloc ntt twiddles");
   check(cudaMemcpy(d_values, values.data(), bytes, cudaMemcpyHostToDevice),
         "copy ntt input to device");
 
@@ -381,8 +407,14 @@ std::vector<std::uint64_t> ntt(const std::vector<std::uint64_t>& values, bool in
 
   for (std::size_t len = 2; len <= n; len <<= 1U) {
     const std::uint64_t w_len = field::root_of_unity(len, inverse);
+    const std::size_t half = len / 2;
+    blocks = static_cast<int>((half + kBlockSize - 1) / kBlockSize);
+    twiddle_kernel<<<blocks, kBlockSize>>>(d_twiddles, half, w_len);
+    check(cudaGetLastError(), "twiddle_kernel");
+    check(cudaDeviceSynchronize(), "twiddle synchronize");
+
     blocks = static_cast<int>(((n / 2) + kBlockSize - 1) / kBlockSize);
-    ntt_stage_kernel<<<blocks, kBlockSize>>>(d_values, n, len, w_len);
+    ntt_stage_kernel<<<blocks, kBlockSize>>>(d_values, n, len, d_twiddles);
     check(cudaGetLastError(), "ntt_stage_kernel");
     check(cudaDeviceSynchronize(), "ntt stage synchronize");
   }
@@ -398,6 +430,7 @@ std::vector<std::uint64_t> ntt(const std::vector<std::uint64_t>& values, bool in
   std::vector<std::uint64_t> out(n);
   check(cudaMemcpy(out.data(), d_values, bytes, cudaMemcpyDeviceToHost), "copy ntt output");
   cudaFree(d_values);
+  cudaFree(d_twiddles);
   return out;
 }
 
