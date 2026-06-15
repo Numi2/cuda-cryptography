@@ -136,7 +136,7 @@ void run_cuda_benchmarks() {
 
 int main() {
   try {
-    std::cout << "cuda-pqc-bench benchmark\n";
+    std::cout << "cuda-cryptography benchmark\n";
     std::cout << "Field modulus: 2^64 - 2^32 + 1 (Goldilocks)\n\n";
     std::cout << "| Backend | Primitive     |        n |  Time (ms) | Throughput Mops/s |\n";
     std::cout << "|--------:|---------------|---------:|-----------:|-----------------:|\n";

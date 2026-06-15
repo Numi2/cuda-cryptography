@@ -1,6 +1,6 @@
-# cuda-pqc-bench
+# cuda-cryptography
 
-`cuda-pqc-bench` is a small CUDA/C++20 benchmark and correctness suite for
+`cuda-cryptography` is a small CUDA/C++20 benchmark and correctness suite for
 post-quantum and proof-system-adjacent cryptographic primitives.
 
 This is research and benchmark code, not production cryptography. It has not
@@ -58,15 +58,23 @@ The benchmark prints elapsed time and throughput for several input sizes. GPU
 rows are shown only when the project is built with CUDA and a CUDA device is
 visible.
 
-Sample output shape:
+## Validated CUDA Results
 
-| Backend | Primitive     |        n |  Time (ms) | Throughput Mops/s |
-|--------:|---------------|---------:|-----------:|-----------------:|
-| CPU     | field add     |     1024 |      0.004 |           256.00 |
-| CPU     | field mul     |     1024 |      0.018 |            56.89 |
-| CUDA    | field add     |     1024 |      0.090 |            11.38 |
-| CUDA    | radix-2 ntt   |     4096 |      1.700 |             2.41 |
-| CUDA    | merkle sha256 |     4096 |      0.950 |             4.31 |
+Validated on an NVIDIA RTX A6000 using CUDA 12.4:
+
+- CUDA build passed,
+- correctness tests passed,
+- commit tested: `823b389`.
+
+Optimization results from the portable CUDA baseline to the current
+Goldilocks-folding and NTT-twiddle implementation:
+
+| Primitive | Size | Baseline | Current | Change |
+|-----------|-----:|---------:|--------:|-------:|
+| NTT | 4096 | 4.32 Mops/s | 10.90 Mops/s | 2.52x |
+| NTT | 16384 | 12.57 Mops/s | 31.25 Mops/s | 2.49x |
+| Field mul | 65536 | 84.91 Mops/s | 94.82 Mops/s | 1.12x |
+| Merkle SHA-256 | 16384 | 39.97 Mops/s | 41.70 Mops/s | 1.04x |
 
 Actual numbers depend heavily on GPU model, CUDA version, clock state, and PCIe
 transfer overhead.
@@ -91,9 +99,9 @@ The CUDA kernels are intentionally simple:
 - Merkle tree hashing launches one kernel per tree level,
 - CUDA SHA-256 is implemented locally for fixed-size leaf and parent inputs.
 
-This keeps the code readable for review and recruitment while still showing the
-core GPU engineering pieces: kernels, memory transfers, deterministic tests,
-and benchmark reporting.
+This keeps the code readable for review while still showing the core GPU
+engineering pieces: kernels, memory transfers, deterministic tests, and
+benchmark reporting.
 
 ## Repository Layout
 
@@ -108,7 +116,6 @@ docs/      design notes
 
 ## Future Work
 
-- optimized Goldilocks reduction without relying on 128-bit device arithmetic,
 - fused NTT stages and shared-memory tiling,
 - batched Merkle trees and persistent device buffers,
 - CUDA events for device-only timing separate from host transfer timing,
