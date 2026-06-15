@@ -50,6 +50,12 @@ Most public CUDA wrapper benchmark rows include allocation, host-to-device copy,
 kernels, synchronization, and device-to-host copy. This is intentional: the
 numbers are honest for the current public API.
 
+Resident-buffer rows are separate. They allocate and copy inputs once, reuse GPU
+scratch buffers across repeated timed iterations, and report CUDA-event
+device-only timing. ML-KEM resident rows include device-to-device work-buffer
+resets so each iteration starts from the same input. Poseidon2 resident rows
+rebuild the tree from resident leaves and copy roots back only after timing.
+
 Poseidon2-style Merkle forest rows report two timings:
 
 - `Host ms`: allocation, host-to-device leaf copy, kernels, synchronization, and
@@ -57,8 +63,8 @@ Poseidon2-style Merkle forest rows report two timings:
 - `Device ms`: CUDA-event timing for leaf and parent kernels while leaves and
   intermediate levels are GPU-resident.
 
-Do not label wrapper rows as persistent-buffer performance. Persistent buffers,
-streamed batches, and fused kernels should be reported separately if added.
+Do not label wrapper rows as resident-buffer performance. Do not compare wrapper
+rows and resident rows without explaining the timing semantics.
 
 ## Interpreting Results
 

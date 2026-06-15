@@ -73,3 +73,13 @@ include(CTest)
 if(BUILD_TESTING)
   add_test(NAME correctness COMMAND cpb_correctness_tests)
 endif()
+
+add_custom_target(format
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/format.sh"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Format C++/CUDA sources with clang-format")
+
+add_custom_target(format-check
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/format.sh" --check
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Check C++/CUDA source formatting with clang-format")

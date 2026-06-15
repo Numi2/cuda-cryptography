@@ -2,11 +2,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -72,6 +72,10 @@ class DeviceBuffer {
 
   void copy_to_host(void* dst, std::size_t byte_count, const char* context) const {
     check(cudaMemcpy(dst, ptr_, byte_count, cudaMemcpyDeviceToHost), context);
+  }
+
+  void copy_from_device(const T* src, std::size_t count, const char* context) {
+    check(cudaMemcpy(ptr_, src, count * sizeof(T), cudaMemcpyDeviceToDevice), context);
   }
 
  private:
@@ -983,6 +987,107 @@ std::vector<mlkem::Poly> mlkem_poly_mul_ntt_batch(
   return out;
 }
 
+CudaBenchmarkResult mlkem_ntt_batch_resident_benchmark(
+    const std::vector<mlkem::Poly>& polys,
+    int iterations,
+    bool inverse) {
+  if (iterations <= 0) {
+    throw std::invalid_argument("resident ML-KEM NTT benchmark iterations must be positive");
+  }
+  if (polys.empty()) {
+    return {};
+  }
+
+  DeviceBuffer<mlkem::Poly> d_input(polys.size());
+  DeviceBuffer<mlkem::Poly> d_work(polys.size());
+  DeviceBuffer<std::uint16_t> d_twiddles(mlkem::kPolyDegree / 2);
+  d_input.copy_from_host(polys.data(), d_input.bytes(), "copy resident mlkem input");
+
+  CudaEvent start;
+  CudaEvent end;
+  check(cudaEventRecord(start.get()), "record resident mlkem ntt start");
+  for (int i = 0; i < iterations; ++i) {
+    d_work.copy_from_device(d_input.data(), d_input.count(), "reset resident mlkem ntt work");
+    kyber_ntt_batch_device(reinterpret_cast<std::uint16_t*>(d_work.data()), polys.size(),
+                           d_twiddles.data(), inverse);
+  }
+  check(cudaEventRecord(end.get()), "record resident mlkem ntt end");
+  check(cudaEventSynchronize(end.get()), "synchronize resident mlkem ntt end");
+
+  float total_ms = 0.0F;
+  check(cudaEventElapsedTime(&total_ms, start.get(), end.get()),
+        "elapsed resident mlkem ntt");
+
+  mlkem::Poly sink{};
+  d_work.copy_to_host(sink.data(), sizeof(sink), "copy resident mlkem ntt sink");
+  CudaBenchmarkResult result;
+  result.device_ms = static_cast<double>(total_ms) / static_cast<double>(iterations);
+  result.operations = polys.size();
+  result.bytes = d_input.bytes();
+  return result;
+}
+
+CudaBenchmarkResult mlkem_poly_mul_ntt_batch_resident_benchmark(
+    const std::vector<mlkem::Poly>& a,
+    const std::vector<mlkem::Poly>& b,
+    int iterations) {
+  if (a.size() != b.size()) {
+    throw std::invalid_argument(
+        "resident ML-KEM poly mul benchmark input sizes differ");
+  }
+  if (iterations <= 0) {
+    throw std::invalid_argument(
+        "resident ML-KEM poly mul benchmark iterations must be positive");
+  }
+  if (a.empty()) {
+    return {};
+  }
+
+  DeviceBuffer<mlkem::Poly> d_a_input(a.size());
+  DeviceBuffer<mlkem::Poly> d_b_input(b.size());
+  DeviceBuffer<mlkem::Poly> d_a_work(a.size());
+  DeviceBuffer<mlkem::Poly> d_b_work(b.size());
+  DeviceBuffer<mlkem::Poly> d_out(a.size());
+  DeviceBuffer<std::uint16_t> d_twiddles(mlkem::kPolyDegree / 2);
+  d_a_input.copy_from_host(a.data(), d_a_input.bytes(), "copy resident mlkem a");
+  d_b_input.copy_from_host(b.data(), d_b_input.bytes(), "copy resident mlkem b");
+
+  auto* a_words = reinterpret_cast<std::uint16_t*>(d_a_work.data());
+  auto* b_words = reinterpret_cast<std::uint16_t*>(d_b_work.data());
+  auto* out_words = reinterpret_cast<std::uint16_t*>(d_out.data());
+
+  CudaEvent start;
+  CudaEvent end;
+  check(cudaEventRecord(start.get()), "record resident mlkem mul start");
+  for (int i = 0; i < iterations; ++i) {
+    d_a_work.copy_from_device(d_a_input.data(), d_a_input.count(),
+                              "reset resident mlkem a");
+    d_b_work.copy_from_device(d_b_input.data(), d_b_input.count(),
+                              "reset resident mlkem b");
+    kyber_ntt_batch_device(a_words, a.size(), d_twiddles.data(), false);
+    kyber_ntt_batch_device(b_words, b.size(), d_twiddles.data(), false);
+    kyber_batched_pointwise_mul_kernel<<<static_cast<unsigned int>(a.size()), 256>>>(
+        a_words, b_words, out_words, a.size());
+    check(cudaGetLastError(), "resident kyber_batched_pointwise_mul_kernel");
+    check(cudaDeviceSynchronize(), "resident kyber pointwise synchronize");
+    kyber_ntt_batch_device(out_words, a.size(), d_twiddles.data(), true);
+  }
+  check(cudaEventRecord(end.get()), "record resident mlkem mul end");
+  check(cudaEventSynchronize(end.get()), "synchronize resident mlkem mul end");
+
+  float total_ms = 0.0F;
+  check(cudaEventElapsedTime(&total_ms, start.get(), end.get()),
+        "elapsed resident mlkem mul");
+
+  mlkem::Poly sink{};
+  d_out.copy_to_host(sink.data(), sizeof(sink), "copy resident mlkem mul sink");
+  CudaBenchmarkResult result;
+  result.device_ms = static_cast<double>(total_ms) / static_cast<double>(iterations);
+  result.operations = a.size();
+  result.bytes = d_a_input.bytes() + d_b_input.bytes();
+  return result;
+}
+
 poseidon2::ForestBuildResult poseidon2_merkle_forest(
     const std::vector<poseidon2::Leaf>& leaves,
     poseidon2::ForestShape shape) {
@@ -1043,6 +1148,75 @@ poseidon2::ForestBuildResult poseidon2_merkle_forest(
   result.host_ms =
       std::chrono::duration<double, std::milli>(host_end - host_start).count();
   result.device_ms = static_cast<double>(device_ms);
+  result.hashes = poseidon2::merkle_hash_count(shape);
+  result.bytes_absorbed = poseidon2::absorbed_bytes_for_hashes(result.hashes);
+  return result;
+}
+
+poseidon2::ForestBuildResult poseidon2_merkle_forest_resident_benchmark(
+    const std::vector<poseidon2::Leaf>& leaves,
+    poseidon2::ForestShape shape,
+    int iterations) {
+  if (shape.tree_count == 0 || shape.leaves_per_tree == 0 ||
+      (shape.leaves_per_tree & (shape.leaves_per_tree - 1)) != 0) {
+    throw std::invalid_argument(
+        "poseidon2 resident CUDA forest shape must use power-of-two trees");
+  }
+  if (iterations <= 0) {
+    throw std::invalid_argument("poseidon2 resident benchmark iterations must be positive");
+  }
+  const std::size_t total_leaves = shape.tree_count * shape.leaves_per_tree;
+  if (leaves.size() != total_leaves) {
+    throw std::invalid_argument(
+        "poseidon2 resident CUDA leaf count does not match forest shape");
+  }
+
+  DeviceBuffer<poseidon2::Leaf> d_leaves(leaves.size());
+  DeviceBuffer<std::uint64_t> d_current(total_leaves * poseidon2::kDigestWords);
+  DeviceBuffer<std::uint64_t> d_next(
+      std::max<std::size_t>(1, (total_leaves * poseidon2::kDigestWords) / 2));
+  d_leaves.copy_from_host(leaves.data(), d_leaves.bytes(),
+                          "copy resident poseidon2 leaves");
+
+  constexpr int kBlockSize = 256;
+  std::uint64_t* roots = nullptr;
+  CudaEvent start;
+  CudaEvent end;
+  check(cudaEventRecord(start.get()), "record resident poseidon2 start");
+  for (int iter = 0; iter < iterations; ++iter) {
+    auto* current = d_current.data();
+    auto* next = d_next.data();
+    int blocks = static_cast<int>((total_leaves + kBlockSize - 1) / kBlockSize);
+    p2_leaf_kernel<<<blocks, kBlockSize>>>(
+        reinterpret_cast<const std::uint64_t*>(d_leaves.data()), current, total_leaves);
+    check(cudaGetLastError(), "resident p2_leaf_kernel");
+
+    std::size_t level_count = shape.leaves_per_tree;
+    while (level_count > 1) {
+      const std::size_t total_parents = shape.tree_count * (level_count / 2);
+      blocks = static_cast<int>((total_parents + kBlockSize - 1) / kBlockSize);
+      p2_parent_kernel<<<blocks, kBlockSize>>>(current, next, shape.tree_count,
+                                               level_count);
+      check(cudaGetLastError(), "resident p2_parent_kernel");
+      std::swap(current, next);
+      level_count >>= 1U;
+    }
+    roots = current;
+  }
+  check(cudaEventRecord(end.get()), "record resident poseidon2 end");
+  check(cudaEventSynchronize(end.get()), "synchronize resident poseidon2 end");
+
+  float total_ms = 0.0F;
+  check(cudaEventElapsedTime(&total_ms, start.get(), end.get()),
+        "elapsed resident poseidon2");
+
+  poseidon2::ForestBuildResult result;
+  result.roots.resize(shape.tree_count);
+  check(cudaMemcpy(result.roots.data(), roots, shape.tree_count * sizeof(poseidon2::Digest),
+                   cudaMemcpyDeviceToHost),
+        "copy resident poseidon2 roots");
+  result.device_ms = static_cast<double>(total_ms) / static_cast<double>(iterations);
+  result.host_ms = 0.0;
   result.hashes = poseidon2::merkle_hash_count(shape);
   result.bytes_absorbed = poseidon2::absorbed_bytes_for_hashes(result.hashes);
   return result;

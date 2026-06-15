@@ -29,6 +29,8 @@ Poseidon2 parameter set.
   at the end.
 - Benchmark reporting that separates host-transfer-included timing from
   Poseidon2 device-only CUDA event timing.
+- Separate resident-buffer benchmark rows for ML-KEM batches and Poseidon2
+  forests, so wrapper overhead and GPU-resident throughput are not conflated.
 
 ## Status
 
@@ -37,7 +39,9 @@ Poseidon2 parameter set.
 | Goldilocks field + radix-2 NTT | Implemented | Readable stage kernels, not a fully fused production NTT |
 | SHA-256 Merkle tree | Implemented | Root builder only; no GPU auth-path extraction |
 | Batched ML-KEM/Kyber primitive path | Implemented benchmark primitive | Not full ML-KEM keygen/encap/decap |
+| ML-KEM resident-buffer benchmark | Implemented benchmark path | Device-resident timing helper, not a reusable production API |
 | Poseidon2-style Merkle forest | Experimental benchmark path | Benchmark constants, not standardized Poseidon2 parameters |
+| Poseidon2 resident-buffer benchmark | Implemented benchmark path | Benchmarks repeated resident builds, not standardized Poseidon2 |
 
 ## Implemented Workloads
 
@@ -65,6 +69,7 @@ Poseidon2 parameter set.
 - CPU NTT-based polynomial multiplication
 - CUDA batched NTT
 - CUDA batched NTT-based polynomial multiplication
+- CUDA resident-buffer benchmark helpers for batched NTT and poly mul
 - benchmark batches in full mode: `1`, `1024`, `10000`, `100000`
 
 The point is batching. A single Kyber-sized polynomial is too small to make CUDA
@@ -77,7 +82,11 @@ look good; batched polynomial operations are the relevant GPU story.
 - CUDA leaf and parent hash kernels
 - intermediate Merkle levels kept GPU-resident
 - host-transfer-included timing and CUDA-event device-only timing
+- resident-buffer benchmark helper for repeated GPU-resident builds
 - CPU verification of generated authentication paths
+
+The exact benchmark permutation shape, round constants, and domain tags are
+documented in [docs/poseidon2-parameters.md](docs/poseidon2-parameters.md).
 
 Full-mode benchmark forest shapes:
 
@@ -171,16 +180,18 @@ Benchmark output prints the mode, GPU name, CUDA runtime/driver versions,
 architecture, elapsed time, throughput, and whether Poseidon2 timings include
 host transfers or device-only CUDA event timing.
 
-Current public CUDA wrappers allocate and copy per call. Those numbers are
-honest wrapper timings, not persistent-buffer optimized timings.
+Current public CUDA wrappers allocate and copy per call. Those wrapper numbers
+are honest API timings. Resident rows are printed separately and keep inputs,
+scratch buffers, and intermediate levels on the GPU across repeated timed
+iterations.
 
 See [docs/benchmark-methodology.md](docs/benchmark-methodology.md) for the exact
 recording checklist.
 
 ## CUDA Validation
 
-Latest quick CUDA validation was run on Brev `cuda-pqc-t4-cheap`, machine type
-`n1-highcpu-4:nvidia-tesla-t4:1`, listed by Brev at `$0.59/hr`.
+Latest quick CUDA validation was run on Brev `cuda-p2-test`, machine type
+`g4dn.xlarge`.
 
 - GPU: NVIDIA Tesla T4, `sm_75`, 14.56 GiB visible memory
 - CUDA container: `nvidia/cuda:12.4.1-devel-ubuntu22.04`
@@ -195,18 +206,27 @@ Latest quick-mode T4 results:
 
 | Primitive | Workload | Time ms | Throughput |
 |-----------|----------|--------:|-----------:|
-| Field mul | `n=65536` | 0.747 | 87.77 Mops/s |
-| Radix-2 NTT | `n=16384` | 0.684 | 23.96 Mops/s |
-| SHA-256 Merkle | `n=16384` | 0.882 | 18.57 Mops/s |
-| ML-KEM NTT | `batch=1024` | 0.876 | 1168.626 Kpoly/s |
-| ML-KEM poly mul | `batch=1024` | 1.584 | 646.563 Kpoly/s |
+| Field mul | `n=65536` | 0.805 | 81.40 Mops/s |
+| Radix-2 NTT | `n=16384` | 0.514 | 31.87 Mops/s |
+| SHA-256 Merkle | `n=16384` | 0.490 | 33.40 Mops/s |
+| ML-KEM NTT | `batch=1024` | 0.790 | 1296.837 Kpoly/s |
+| ML-KEM poly mul | `batch=1024` | 1.258 | 814.126 Kpoly/s |
+
+Latest quick-mode resident-buffer rows:
+
+| Primitive | Workload | Device ms | Throughput |
+|-----------|----------|----------:|-----------:|
+| ML-KEM NTT resident | `batch=1024` | 0.129 | 7962.377 Kpoly/s |
+| ML-KEM poly mul resident | `batch=1024` | 0.394 | 2602.028 Kpoly/s |
+| Poseidon2 resident | `1 x 2^10 leaves` | 1.510 | 1.36 Mhash/s |
+| Poseidon2 resident | `32 x 2^10` | 2.161 | 30.31 Mhash/s |
 
 Latest quick-mode Poseidon2-style Merkle forest rows:
 
 | Workload | Host ms | Device ms | Host Mhash/s | Host GB/s | Device Mhash/s | Device GB/s |
 |----------|--------:|----------:|-------------:|----------:|---------------:|------------:|
-| `1 x 2^10 leaves` | 4.163 | 3.919 | 0.49 | 0.03 | 0.52 | 0.03 |
-| `32 x 2^10` | 6.518 | 5.659 | 10.05 | 0.60 | 11.58 | 0.69 |
+| `1 x 2^10 leaves` | 1.801 | 1.639 | 1.14 | 0.07 | 1.25 | 0.07 |
+| `32 x 2^10` | 2.999 | 2.174 | 21.84 | 1.30 | 30.12 | 1.80 |
 
 The quick-mode T4 numbers include current wrapper allocation/copy overhead, and
 the Poseidon2 rows also report device-only CUDA event timing. They are intended
@@ -254,8 +274,20 @@ path.
 - Batched ML-KEM kernels map each polynomial to a CUDA block.
 - Poseidon2-style Merkle forests copy leaves once, alternate resident level
   buffers, and copy only roots back.
+- Resident benchmark helpers allocate/copy once, then report CUDA-event
+  device-only timing for repeated ML-KEM or Poseidon2 runs.
 - Goldilocks CUDA multiplication uses `__umul64hi` to recover the high half of
   a 64x64 product and folds with `2^64 = 2^32 - 1 mod p`.
+
+## Formatting
+
+```bash
+./scripts/format.sh --check
+./scripts/format.sh
+cmake --build build --target format-check
+```
+
+The format targets require `clang-format`.
 
 ## Repository Layout
 
@@ -264,14 +296,13 @@ include/   public headers
 src/       CPU and CUDA implementations
 tests/     correctness tests
 bench/     benchmark executable
-scripts/   build, test, and benchmark helpers
-docs/      design and benchmark notes
+scripts/   build, test, benchmark, and formatting helpers
+docs/      design, parameter, and benchmark notes
 ```
 
 ## Focused Future Work
 
 - Standardized Poseidon2 parameters and published vectors.
-- Persistent CUDA buffers for repeated benchmark runs.
 - CUDA auth-path extraction from resident tree levels.
 - Fused NTT stages and shared-memory tiling after benchmark baselines are stable.
 - A reproducible benchmark matrix by GPU architecture.

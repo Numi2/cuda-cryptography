@@ -393,12 +393,23 @@ bool test_cuda_primitives() {
                      "cuda mlkem ntt batch");
   ok &= expect_equal(expected_mul, cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, batch_b),
                      "cuda mlkem poly mul batch");
+  const auto resident_ntt =
+      cpb::cuda::mlkem_ntt_batch_resident_benchmark(batch_a, 2);
+  ok &= resident_ntt.operations == batch_a.size();
+  ok &= resident_ntt.device_ms >= 0.0;
+  const auto resident_mul =
+      cpb::cuda::mlkem_poly_mul_ntt_batch_resident_benchmark(batch_a, batch_b, 2);
+  ok &= resident_mul.operations == batch_a.size();
+  ok &= resident_mul.device_ms >= 0.0;
   ok &= expect_throws(
       [&] {
         std::vector<cpb::mlkem::Poly> shorter(31);
         cpb::cuda::mlkem_poly_mul_ntt_batch(batch_a, shorter);
       },
       "cuda mlkem rejects mismatched batch sizes");
+  ok &= expect_throws(
+      [&] { cpb::cuda::mlkem_ntt_batch_resident_benchmark(batch_a, 0); },
+      "cuda resident mlkem rejects zero iterations");
 
   const cpb::poseidon2::ForestShape p2_shape{4, 16};
   const auto p2_leaves = cpb::poseidon2::deterministic_leaves(
@@ -406,6 +417,11 @@ bool test_cuda_primitives() {
   const auto p2_cpu = cpb::poseidon2::merkle_forest_roots_cpu(p2_leaves, p2_shape);
   const auto p2_cuda = cpb::cuda::poseidon2_merkle_forest(p2_leaves, p2_shape);
   ok &= expect_equal(p2_cpu.roots, p2_cuda.roots, "cuda poseidon2 merkle forest");
+  const auto p2_resident =
+      cpb::cuda::poseidon2_merkle_forest_resident_benchmark(p2_leaves, p2_shape, 2);
+  ok &= expect_equal(p2_cpu.roots, p2_resident.roots,
+                     "cuda resident poseidon2 merkle forest");
+  ok &= p2_resident.device_ms >= 0.0;
   return ok;
 #else
   std::cout << "Built without CUDA; CPU correctness checks completed\n";

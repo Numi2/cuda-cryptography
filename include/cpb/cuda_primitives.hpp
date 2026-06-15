@@ -21,6 +21,12 @@ struct DeviceInfo {
   std::size_t global_memory_bytes = 0;
 };
 
+struct CudaBenchmarkResult {
+  double device_ms = 0.0;
+  std::size_t operations = 0;
+  std::size_t bytes = 0;
+};
+
 bool is_available();
 DeviceInfo device_info();
 
@@ -44,8 +50,23 @@ std::vector<mlkem::Poly> mlkem_poly_mul_ntt_batch(
     const std::vector<mlkem::Poly>& a,
     const std::vector<mlkem::Poly>& b);
 
+CudaBenchmarkResult mlkem_ntt_batch_resident_benchmark(
+    const std::vector<mlkem::Poly>& polys,
+    int iterations,
+    bool inverse = false);
+
+CudaBenchmarkResult mlkem_poly_mul_ntt_batch_resident_benchmark(
+    const std::vector<mlkem::Poly>& a,
+    const std::vector<mlkem::Poly>& b,
+    int iterations);
+
 poseidon2::ForestBuildResult poseidon2_merkle_forest(
     const std::vector<poseidon2::Leaf>& leaves,
     poseidon2::ForestShape shape);
+
+poseidon2::ForestBuildResult poseidon2_merkle_forest_resident_benchmark(
+    const std::vector<poseidon2::Leaf>& leaves,
+    poseidon2::ForestShape shape,
+    int iterations);
 
 }  // namespace cpb::cuda

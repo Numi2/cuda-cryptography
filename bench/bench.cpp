@@ -137,6 +137,23 @@ void print_poseidon2_row(const std::string& backend,
             << std::setw(13) << device_gbs << " |\n";
 }
 
+void print_poseidon2_device_row(const std::string& backend,
+                                const std::string& workload,
+                                double device_ms,
+                                std::size_t hashes,
+                                std::size_t bytes_absorbed) {
+  const double device_hashes_s = static_cast<double>(hashes) / (device_ms / 1000.0);
+  const double device_gbs =
+      (static_cast<double>(bytes_absorbed) / (1024.0 * 1024.0 * 1024.0)) /
+      (device_ms / 1000.0);
+
+  std::cout << "| " << std::left << std::setw(8) << backend << " | "
+            << std::setw(22) << workload << " | " << std::right << std::setw(10)
+            << std::fixed << std::setprecision(3) << device_ms << " | "
+            << std::setw(17) << std::setprecision(2) << (device_hashes_s / 1.0e6)
+            << " | " << std::setw(13) << device_gbs << " |\n";
+}
+
 std::vector<cpb::mlkem::Poly> deterministic_poly_batch(std::size_t batch,
                                                        std::uint32_t seed) {
   std::vector<cpb::mlkem::Poly> out(batch);
@@ -270,6 +287,34 @@ void run_mlkem_cuda_benchmarks(BenchMode mode) {
                     "batch=" + std::to_string(batch_size), batch_mul_ms,
                     static_cast<double>(batch_size) / batch_mul_ms);
   }
+
+  std::cout << "\nML-KEM/Kyber-style resident device benchmark\n";
+  std::cout << "Rows keep inputs and scratch buffers allocated on the GPU. Device time "
+               "includes device-to-device work-buffer resets, kernels, and synchronizations; "
+               "it excludes host transfers and allocation.\n\n";
+  std::cout << "| Backend | Primitive           | Workload     |  Time (ms) | Throughput Kpoly/s |\n";
+  std::cout << "|--------:|---------------------|--------------|-----------:|-------------------:|\n";
+  for (const std::size_t batch_size : batches) {
+    const auto batch = deterministic_poly_batch(batch_size, 3701);
+    const int iterations = batch_size <= 1024 ? 20 : 5;
+    const auto resident =
+        cpb::cuda::mlkem_ntt_batch_resident_benchmark(batch, iterations);
+    print_mlkem_row("CUDA-R", "ML-KEM NTT",
+                    "batch=" + std::to_string(batch_size), resident.device_ms,
+                    static_cast<double>(resident.operations) / resident.device_ms);
+  }
+
+  for (const std::size_t batch_size : batches) {
+    const auto batch_a = deterministic_poly_batch(batch_size, 4701);
+    const auto batch_b = deterministic_poly_batch(batch_size, 5701);
+    const int iterations = batch_size <= 1024 ? 10 : 5;
+    const auto resident =
+        cpb::cuda::mlkem_poly_mul_ntt_batch_resident_benchmark(batch_a, batch_b,
+                                                               iterations);
+    print_mlkem_row("CUDA-R", "ML-KEM poly mul",
+                    "batch=" + std::to_string(batch_size), resident.device_ms,
+                    static_cast<double>(resident.operations) / resident.device_ms);
+  }
 #else
   std::cout << "\nBuilt without CUDA. Reconfigure on a CUDA machine for ML-KEM GPU rows.\n";
 #endif
@@ -333,6 +378,24 @@ void run_poseidon2_cuda_benchmarks(BenchMode mode) {
     g_sink ^= result.roots.front().front();
     print_poseidon2_row("CUDA", label, result.host_ms, result.device_ms,
                         result.hashes, result.bytes_absorbed);
+  }
+
+  std::cout << "\nPoseidon2-style resident device benchmark\n";
+  std::cout << "Rows allocate/copy leaves once, keep Merkle levels resident, and average "
+               "CUDA-event kernel time across repeated tree builds.\n\n";
+  std::cout << "| Backend  | Workload               | Device ms | Device Mhash/s   | Device GB/s   |\n";
+  std::cout << "|---------:|------------------------|----------:|-----------------:|--------------:|\n";
+  for (std::size_t i = 0; i < shapes.size(); ++i) {
+    const auto& [label, shape] = shapes[i];
+    const auto leaves = cpb::poseidon2::deterministic_leaves(
+        shape.tree_count * shape.leaves_per_tree, 22000 + i);
+    const int iterations = mode == BenchMode::Full ? 5 : 10;
+    const auto result =
+        cpb::cuda::poseidon2_merkle_forest_resident_benchmark(leaves, shape,
+                                                              iterations);
+    g_sink ^= result.roots.front().front();
+    print_poseidon2_device_row("CUDA-R", label, result.device_ms, result.hashes,
+                               result.bytes_absorbed);
   }
 #else
   std::cout << "\nBuilt without CUDA. Reconfigure on a CUDA machine for "
